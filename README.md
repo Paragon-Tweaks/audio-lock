@@ -77,6 +77,6 @@ git push origin v0.1.0
 
 ## License
 
-Copyright (C) 2026 Paragon Tweaks.
+Copyright (c) 2026 Tulantro LLC (Paragon Tweaks) - @TheTulantro @ParagonTweaks.
 
 Licensed under the **GNU General Public License v3.0** (`GPL-3.0-only`). See [LICENSE](LICENSE) for the full text.
