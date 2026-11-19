@@ -31,6 +31,7 @@ OutputBaseFilename=DefaultAudioLock-Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\app.ico
 UninstallDisplayIcon={app}\default-audio-lock.exe
 ; Uncomment once a code-signing certificate is configured (pass /Ssigntool="..." to iscc):
 ; SignTool=signtool
@@ -41,13 +42,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "autostart"; Description: "Start Default Audio Lock when Windows starts"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
 Source: "{#SourceDir}\default-audio-lock.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Default Audio Lock"; Filename: "{app}\default-audio-lock.exe"
-Name: "{group}\Uninstall Default Audio Lock"; Filename: "{uninstallexe}"
+Name: "{group}\Audio Lock"; Filename: "{app}\default-audio-lock.exe"
+Name: "{group}\Uninstall Audio Lock"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Audio Lock"; Filename: "{app}\default-audio-lock.exe"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DefaultAudioLock"; ValueData: """{app}\default-audio-lock.exe"""; Tasks: autostart; Flags: uninsdeletevalue

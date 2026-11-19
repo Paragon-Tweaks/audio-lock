@@ -222,6 +222,7 @@ impl FlyoutController {
             pending_high_surrogate: None,
             active_overlay: ActiveOverlay::None,
             saving_profile: false,
+            confirm_quit: false,
             profile_name_input: String::new(),
             status_text: "Auto-saved".to_string(),
             status_flash: false,
@@ -330,6 +331,7 @@ struct WindowData {
     pending_high_surrogate: Option<u16>,
     active_overlay: ActiveOverlay,
     saving_profile: bool,
+    pub confirm_quit: bool,
     profile_name_input: String,
     status_text: String,
     status_flash: bool,
@@ -380,6 +382,7 @@ impl WindowData {
             listen_search_query: &self.listen_search_query,
             active_overlay: &self.active_overlay,
             saving_profile: self.saving_profile,
+            confirm_quit: self.confirm_quit,
             device_scroll: self.device_scroll,
             config_scroll: self.config_scroll,
             profile_scroll: self.profile_scroll,
@@ -559,16 +562,27 @@ impl WindowData {
             .map(|h| h.action.clone());
 
         let Some(action) = hit_action else {
+            let mut dirty = false;
+            if self.confirm_quit {
+                self.confirm_quit = false;
+                dirty = true;
+            }
             if self.active_input == ActiveInput::Search {
                 self.active_input = ActiveInput::None;
                 self.input_selected_all = false;
-                self.refresh(hwnd);
+                dirty = true;
             } else if self.input_selected_all {
                 self.input_selected_all = false;
+                dirty = true;
+            }
+            if dirty {
                 self.refresh(hwnd);
             }
             return;
         };
+
+        let cleared_confirm_quit = !matches!(action, HitAction::ConfigQuit)
+            && std::mem::replace(&mut self.confirm_quit, false);
 
         let state = self.snapshot();
         match action {
@@ -659,6 +673,8 @@ impl WindowData {
                         self.active_input = ActiveInput::None;
                     }
                     self.refresh(hwnd);
+                } else if cleared_confirm_quit {
+                    self.refresh(hwnd);
                 }
             }
             HitAction::FocusSearch => {
@@ -693,10 +709,16 @@ impl WindowData {
             }
             HitAction::VolumeBar(device_id) => {
                 if state.device(&device_id).is_some_and(|d| d.disabled) {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 }
                 let Some(bar_rect) = self.layout.as_ref().and_then(|l| l.slider_rect(&device_id))
                 else {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 };
                 self.active_overlay = ActiveOverlay::None;
@@ -745,6 +767,9 @@ impl WindowData {
             }
             HitAction::ToggleDeviceDisabled(device_id) => {
                 if state.auto_disable_unused_devices {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 }
                 let next_disabled = !state.device(&device_id).is_some_and(|d| d.disabled);
@@ -827,7 +852,7 @@ impl WindowData {
                 }
             }
             HitAction::OverlaySurface => {
-                if self.input_selected_all {
+                if self.input_selected_all || cleared_confirm_quit {
                     self.input_selected_all = false;
                     self.refresh(hwnd);
                 }
@@ -887,6 +912,9 @@ impl WindowData {
             }
             HitAction::ConfigRightClick(rc_action) => {
                 if state.right_click_action == rc_action {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 }
                 let msg = match rc_action {
@@ -927,8 +955,14 @@ impl WindowData {
                 request_close(hwnd);
             }
             HitAction::ConfigQuit => {
-                self.shared.push_event(FlyoutEvent::Quit);
-                request_close(hwnd);
+                if self.confirm_quit {
+                    self.confirm_quit = false;
+                    self.shared.push_event(FlyoutEvent::Quit);
+                    request_close(hwnd);
+                } else {
+                    self.confirm_quit = true;
+                    self.refresh(hwnd);
+                }
             }
             HitAction::ApplyProfile(profile_id) => {
                 let Some(name) = state
@@ -937,6 +971,9 @@ impl WindowData {
                     .find(|p| p.id == profile_id)
                     .map(|p| p.name.clone())
                 else {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 };
                 self.active_overlay = ActiveOverlay::None;
@@ -954,6 +991,9 @@ impl WindowData {
                     .find(|p| p.id == profile_id)
                     .map(|p| p.name.clone())
                 else {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
                     return;
                 };
                 self.dispatch(
@@ -1012,7 +1052,11 @@ impl WindowData {
                 } else {
                     self.close_listen_overlay(hwnd);
                 }
+            } else if self.active_overlay == ActiveOverlay::Config && self.confirm_quit {
+                self.confirm_quit = false;
+                self.refresh(hwnd);
             } else if self.active_overlay != ActiveOverlay::None {
+                self.confirm_quit = false;
                 self.active_overlay = ActiveOverlay::None;
                 self.refresh(hwnd);
             } else if self.saving_profile {
@@ -1346,6 +1390,7 @@ fn request_close(hwnd: HWND) {
             false
         } else {
             data.is_closing = true;
+            data.confirm_quit = false;
             if data.dragging_volume.take().is_some() {
                 unsafe {
                     let _ = ReleaseCapture();
@@ -2934,17 +2979,36 @@ fn paint_config_overlay_shapes(
             ConfigRowKind::Divider { y, left, right } => {
                 canvas.hline(*left, *right, *y, bw_px, theme.divider);
             }
-            ConfigRowKind::QuitRow { icon_rect, .. } => {
+            ConfigRowKind::QuitRow {
+                icon_rect,
+                confirm_quit,
+                ..
+            } => {
                 let hov = data.hovered_action.as_ref() == Some(&HitAction::ConfigQuit);
-                if hov {
-                    canvas.fill_round_rect(row.rect, 7.0 * s, Some(theme.bg_hover), None);
+                if *confirm_quit {
+                    canvas.fill_round_rect(
+                        row.rect,
+                        6.0 * s,
+                        Some(if hov { theme.inv_hover } else { theme.inv_bg }),
+                        None,
+                    );
+                    canvas.draw_icon_centered(
+                        IconKind::Power,
+                        *icon_rect,
+                        13.0 * s,
+                        theme.inv_text,
+                    );
+                } else {
+                    if hov {
+                        canvas.fill_round_rect(row.rect, 7.0 * s, Some(theme.bg_hover), None);
+                    }
+                    canvas.draw_icon_centered(
+                        IconKind::Power,
+                        *icon_rect,
+                        13.0 * s,
+                        if hov { theme.text } else { theme.text_sec },
+                    );
                 }
-                canvas.draw_icon_centered(
-                    IconKind::Power,
-                    *icon_rect,
-                    13.0 * s,
-                    if hov { theme.text } else { theme.text_sec },
-                );
             }
         }
     }
@@ -3348,14 +3412,27 @@ fn paint_overlay_text(
                         }
                     }
                     ConfigRowKind::Divider { .. } => {}
-                    ConfigRowKind::QuitRow { label_rect, .. } => {
+                    ConfigRowKind::QuitRow {
+                        label_rect,
+                        confirm_quit,
+                        ..
+                    } => {
                         let hov = data.hovered_action.as_ref() == Some(&HitAction::ConfigQuit);
+                        let (font, label, color) = if *confirm_quit {
+                            (FontRole::Body11_5Semi, "Confirm Quit?", theme.inv_text)
+                        } else {
+                            (
+                                FontRole::Body11_5Med,
+                                "Quit Audio Lock",
+                                if hov { theme.text } else { theme.text_sec },
+                            )
+                        };
                         draw_text(
                             hdc,
-                            fonts.get(FontRole::Body11_5Med),
-                            "Quit Audio Lock",
+                            fonts.get(font),
+                            label,
                             *label_rect,
-                            if hov { theme.text } else { theme.text_sec },
+                            color,
                             TextAlign::Left,
                             false,
                         );
@@ -3738,6 +3815,7 @@ mod tests {
                 listen_search_query: "",
                 active_overlay: &ActiveOverlay::None,
                 saving_profile: false,
+                confirm_quit: false,
                 device_scroll: 0,
                 config_scroll: 0,
                 profile_scroll: 0,
@@ -3792,6 +3870,7 @@ mod tests {
                 listen_search_query: "",
                 active_overlay: &ActiveOverlay::Config,
                 saving_profile: false,
+                confirm_quit: false,
                 device_scroll: 0,
                 config_scroll: 0,
                 profile_scroll: 0,
@@ -3802,6 +3881,49 @@ mod tests {
             cfg_layout.hit_test(20, 20).map(|h| &h.action),
             Some(&HitAction::DismissOverlay)
         );
+        if let OverlayLayout::Config(cfg) = &cfg_layout.overlay {
+            assert!(cfg.rows.iter().any(|r| matches!(
+                r.kind,
+                ConfigRowKind::QuitRow {
+                    confirm_quit: false,
+                    ..
+                }
+            )));
+        } else {
+            panic!("expected config overlay layout");
+        }
+
+        let cfg_confirm_layout = FlyoutLayout::compute(
+            dc,
+            &fonts,
+            &LayoutInput {
+                width: 468,
+                height: 600,
+                scale: 1.0,
+                state: &state,
+                active_tab: DeviceFlow::Output,
+                search_query: "",
+                listen_search_query: "",
+                active_overlay: &ActiveOverlay::Config,
+                saving_profile: false,
+                confirm_quit: true,
+                device_scroll: 0,
+                config_scroll: 0,
+                profile_scroll: 0,
+                listen_scroll: 0,
+            },
+        );
+        if let OverlayLayout::Config(cfg) = &cfg_confirm_layout.overlay {
+            assert!(cfg.rows.iter().any(|r| matches!(
+                r.kind,
+                ConfigRowKind::QuitRow {
+                    confirm_quit: true,
+                    ..
+                }
+            )));
+        } else {
+            panic!("expected config overlay layout");
+        }
 
         // Input tab renders Listen row and Listen overlay filters playback outputs cleanly.
         let listen_layout = FlyoutLayout::compute(
@@ -3817,6 +3939,7 @@ mod tests {
                 listen_search_query: "monitor",
                 active_overlay: &ActiveOverlay::ListenTarget("in-1".to_string()),
                 saving_profile: false,
+                confirm_quit: false,
                 device_scroll: 0,
                 config_scroll: 0,
                 profile_scroll: 0,

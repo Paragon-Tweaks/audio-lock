@@ -4,11 +4,30 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../../assets/app.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
+    let icon_path = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/tray must be nested two levels below workspace root")
+        .join("assets")
+        .join("app.ico");
+    assert!(
+        icon_path.is_file(),
+        "application icon not found at {}",
+        icon_path.display()
+    );
+    let icon_path_rc = icon_path
+        .to_str()
+        .expect("icon path must be valid UTF-8")
+        .replace('\\', "\\\\");
 
     let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION must be set");
     let major: u16 = env::var("CARGO_PKG_VERSION_MAJOR")
@@ -25,7 +44,9 @@ fn main() {
         .expect("CARGO_PKG_VERSION_PATCH must be a valid u16");
 
     let rc = format!(
-        r#"1 VERSIONINFO
+        r#"1 ICON "{icon_path_rc}"
+
+1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
 PRODUCTVERSION {major},{minor},{patch},0
 FILEFLAGSMASK 0x3fL

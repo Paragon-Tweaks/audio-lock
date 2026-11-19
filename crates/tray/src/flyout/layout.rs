@@ -113,6 +113,7 @@ pub struct LayoutInput<'a> {
     pub listen_search_query: &'a str,
     pub active_overlay: &'a ActiveOverlay,
     pub saving_profile: bool,
+    pub confirm_quit: bool,
     pub device_scroll: i32,
     pub config_scroll: i32,
     pub profile_scroll: i32,
@@ -237,6 +238,7 @@ pub enum ConfigRowKind {
     QuitRow {
         icon_rect: RectPx,
         label_rect: RectPx,
+        confirm_quit: bool,
     },
 }
 
@@ -1446,6 +1448,7 @@ fn compute_config_overlay(
                     kind: ConfigRowKind::QuitRow {
                         icon_rect,
                         label_rect,
+                        confirm_quit: input.confirm_quit,
                     },
                 });
                 y += height + gap;

@@ -188,6 +188,7 @@ impl PopupMenu {
             scroll_offset: 0,
             hovered: None,
             pressed: None,
+            confirm_quit: false,
             tracking_mouse: false,
             dwm_border_ok,
             is_closing: false,
@@ -268,6 +269,7 @@ struct WindowData {
     scroll_offset: i32,
     hovered: Option<HitItem>,
     pressed: Option<HitItem>,
+    confirm_quit: bool,
     tracking_mouse: bool,
     dwm_border_ok: bool,
     is_closing: bool,
@@ -648,6 +650,7 @@ fn request_close(hwnd: HWND) {
             false
         } else {
             data.is_closing = true;
+            data.confirm_quit = false;
             true
         }
     };
@@ -751,7 +754,7 @@ unsafe extern "system" fn popup_wnd_proc(
         }
         WM_LBUTTONUP => {
             let (x, y) = lparam_point(lparam);
-            let should_close = {
+            let (should_close, should_repaint) = {
                 let data = unsafe { &mut *ptr };
                 let hit = data.layout.hit_test(x, y);
                 let pressed = data.pressed.take();
@@ -762,10 +765,12 @@ unsafe extern "system" fn popup_wnd_proc(
                 };
                 match matched {
                     Some(HitItem::OpenFlyout) => {
+                        data.confirm_quit = false;
                         data.shared.push_action(PopupAction::OpenFlyout(data.anchor));
-                        true
+                        (true, false)
                     }
                     Some(HitItem::ToggleLock) => {
+                        let was_confirming = std::mem::replace(&mut data.confirm_quit, false);
                         let next = !data
                             .shared
                             .state
@@ -774,24 +779,38 @@ unsafe extern "system" fn popup_wnd_proc(
                             .lock_enabled;
                         data.shared
                             .push_action(PopupAction::ApplyAction(AppAction::SetLockEnabled(next)));
-                        false
+                        (false, was_confirming)
                     }
                     Some(HitItem::Profile(id)) => {
+                        data.confirm_quit = false;
                         data.shared
                             .push_action(PopupAction::ApplyAction(AppAction::ApplyProfile {
                                 profile_id: id,
                             }));
-                        true
+                        (true, false)
                     }
                     Some(HitItem::Quit) => {
-                        data.shared.push_action(PopupAction::Quit);
-                        true
+                        if data.confirm_quit {
+                            data.confirm_quit = false;
+                            data.shared.push_action(PopupAction::Quit);
+                            (true, false)
+                        } else {
+                            data.confirm_quit = true;
+                            (false, true)
+                        }
                     }
-                    None => false,
+                    None => {
+                        let was_confirming = std::mem::replace(&mut data.confirm_quit, false);
+                        (false, was_confirming)
+                    }
                 }
             };
             if should_close {
                 request_close(hwnd);
+            } else if should_repaint {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             LRESULT(0)
         }
@@ -834,7 +853,17 @@ unsafe extern "system" fn popup_wnd_proc(
         }
         WM_KEYDOWN => {
             if (wparam.0 as u16) == VK_ESCAPE.0 {
-                request_close(hwnd);
+                let cancelled_confirm = {
+                    let data = unsafe { &mut *ptr };
+                    std::mem::replace(&mut data.confirm_quit, false)
+                };
+                if cancelled_confirm {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else {
+                    request_close(hwnd);
+                }
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -925,6 +954,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
     let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(hbitmap.0)) };
 
     let font_regular = create_ui_font(12.5, scale, FW_NORMAL.0 as i32);
+    let font_semibold = create_ui_font(12.5, scale, FW_SEMIBOLD.0 as i32);
     let font_profile_regular = create_ui_font(12.0, scale, FW_NORMAL.0 as i32);
     let font_profile_active = create_ui_font(12.0, scale, FW_SEMIBOLD.0 as i32);
     let font_header = create_ui_font(10.0, scale, FW_SEMIBOLD.0 as i32);
@@ -1061,7 +1091,9 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
             palette.divider,
         );
 
-        if data.hovered == Some(HitItem::Quit) {
+        if data.confirm_quit {
+            canvas.fill_rounded_rect(layout.quit_row, radius, Some(palette.inv_bg), None);
+        } else if data.hovered == Some(HitItem::Quit) {
             canvas.fill_rounded_rect(layout.quit_row, radius, Some(palette.bg_hover), None);
         }
         draw_row_left_icon(
@@ -1070,7 +1102,11 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
             pad_x,
             icon_size,
             IconKind::Power,
-            palette.text_sec,
+            if data.confirm_quit {
+                palette.inv_text
+            } else {
+                palette.text_sec
+            },
         );
     }
 
@@ -1208,15 +1244,23 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
         }
     }
 
-    let quit_text_color = if data.hovered == Some(HitItem::Quit) {
-        palette.text
+    let (quit_font, quit_label, quit_text_color) = if data.confirm_quit {
+        (font_semibold, "Confirm Quit?", palette.inv_text)
     } else {
-        palette.text_sec
+        (
+            font_regular,
+            "Quit",
+            if data.hovered == Some(HitItem::Quit) {
+                palette.text
+            } else {
+                palette.text_sec
+            },
+        )
     };
     draw_text_line(
         mem_dc,
-        font_regular,
-        "Quit",
+        quit_font,
+        quit_label,
         RectPx {
             left: layout.quit_row.left + pad_x + icon_advance,
             top: layout.quit_row.top,
@@ -1231,6 +1275,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
         SelectObject(mem_dc, old_font);
         let _ = DeleteObject(HGDIOBJ(font_regular.0));
+        let _ = DeleteObject(HGDIOBJ(font_semibold.0));
         let _ = DeleteObject(HGDIOBJ(font_profile_regular.0));
         let _ = DeleteObject(HGDIOBJ(font_profile_active.0));
         let _ = DeleteObject(HGDIOBJ(font_header.0));
