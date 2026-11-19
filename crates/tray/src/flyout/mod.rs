@@ -283,7 +283,7 @@ impl FlyoutController {
         if ptr.is_null() {
             return;
         }
-        let border_update = {
+        let (border_update, should_release_capture, should_repaint) = {
             let data = unsafe { &mut *ptr };
             let snapshot = data
                 .shared
@@ -291,19 +291,60 @@ impl FlyoutController {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            data.recompute_layout(&snapshot);
-            if data.last_theme != snapshot.theme {
-                data.last_theme = snapshot.theme;
-                Some(Theme::from_mode(snapshot.theme).border_strong)
+            let drag_invalidated = data.dragging_volume.as_ref().is_some_and(|(drag_id, _)| {
+                snapshot.device(drag_id).is_none_or(|d| d.disabled)
+            });
+            if drag_invalidated {
+                data.dragging_volume = None;
+            }
+            let drag_fast_path = if let Some((drag_id, _)) = data.dragging_volume.as_ref()
+                && data.last_theme == snapshot.theme
+                && let Some(layout) = data.layout.as_mut()
+            {
+                let mut other_changed = false;
+                for card in &mut layout.cards {
+                    if card.device_id == *drag_id {
+                        continue;
+                    }
+                    if let Some(dev) = snapshot.device(&card.device_id) {
+                        let vol = dev.volume.min(100);
+                        if card.volume != vol || card.muted != dev.muted {
+                            card.volume = vol;
+                            card.muted = dev.muted;
+                            other_changed = true;
+                        }
+                    }
+                }
+                Some(other_changed)
             } else {
                 None
+            };
+
+            if let Some(other_changed) = drag_fast_path {
+                (None, false, other_changed)
+            } else {
+                data.recompute_layout(&snapshot);
+                let border = if data.last_theme != snapshot.theme {
+                    data.last_theme = snapshot.theme;
+                    Some(Theme::from_mode(snapshot.theme).border_strong)
+                } else {
+                    None
+                };
+                (border, drag_invalidated, true)
             }
         };
+        if should_release_capture {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
         if let Some(border) = border_update {
             let _ = apply_dwm_chrome(hwnd, border);
         }
-        unsafe {
-            let _ = InvalidateRect(Some(hwnd), None, false);
+        if should_repaint {
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
         }
     }
 
@@ -633,19 +674,28 @@ impl WindowData {
     }
 
     fn update_volume_from_x(&mut self, hwnd: HWND, device_id: &str, bar_rect: RectPx, x: i32) {
-        let pad_l = TACTILE_PAD_LEFT_LOGICAL * self.scale;
-        let pad_r = TACTILE_PAD_RIGHT_LOGICAL * self.scale;
-        let usable = (bar_rect.width() as f32 - pad_l - pad_r).max(1.0);
-        let ratio = ((x as f32 - (bar_rect.left as f32 + pad_l)) / usable).clamp(0.0, 1.0);
-        let next_volume = (ratio * 100.0).round() as u8;
+        let next_volume = volume_from_bar_x(bar_rect, x, self.scale);
 
-        let (should_unmute, volume_changed) = {
+        let (prev_volume, was_muted) = if let Some(card) =
+            self.layout.as_ref().and_then(|l| l.card(device_id))
+        {
+            if card.disabled {
+                return;
+            }
+            (card.volume, card.muted)
+        } else {
             let guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(dev) = guard.device(device_id) else {
                 return;
             };
-            (dev.muted && next_volume > 0, dev.volume != next_volume)
+            if dev.disabled {
+                return;
+            }
+            (dev.volume.min(100), dev.muted)
         };
+
+        let should_unmute = was_muted && next_volume > 0;
+        let volume_changed = prev_volume != next_volume;
         if !should_unmute && !volume_changed {
             return;
         }
@@ -661,7 +711,22 @@ impl WindowData {
                 volume: next_volume,
             });
         }
-        self.refresh(hwnd);
+
+        let next_muted = was_muted && !should_unmute;
+        if let Some(dirty) = self
+            .layout
+            .as_mut()
+            .and_then(|l| l.update_card_volume(device_id, next_volume, next_muted))
+        {
+            if !dirty.is_empty() {
+                let rect = dirty.to_win32();
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
+                }
+            }
+        } else {
+            self.refresh(hwnd);
+        }
     }
 
     fn commit_save_profile(&mut self, hwnd: HWND) {
@@ -883,6 +948,14 @@ impl WindowData {
                     }
                     return PostMsgAction::None;
                 };
+                let cleared_ui_focus = cleared_confirm_quit
+                    || self.active_overlay != ActiveOverlay::None
+                    || !self.listen_search_query.is_empty()
+                    || self.input_selected_all
+                    || matches!(
+                        self.active_input,
+                        ActiveInput::Search | ActiveInput::ListenSearch
+                    );
                 self.active_overlay = ActiveOverlay::None;
                 self.listen_search_query.clear();
                 self.input_selected_all = false;
@@ -894,6 +967,11 @@ impl WindowData {
                 }
                 self.dragging_volume = Some((device_id.clone(), bar_rect));
                 self.update_volume_from_x(hwnd, &device_id, bar_rect, x);
+                if cleared_ui_focus {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
                 PostMsgAction::Capture
             }
             HitAction::ToggleMute(device_id) => {
@@ -1487,6 +1565,14 @@ impl WindowData {
     }
 }
 
+fn volume_from_bar_x(bar_rect: RectPx, x: i32, scale: f32) -> u8 {
+    let pad_l = TACTILE_PAD_LEFT_LOGICAL * scale;
+    let pad_r = TACTILE_PAD_RIGHT_LOGICAL * scale;
+    let usable = (bar_rect.width() as f32 - pad_l - pad_r).max(1.0);
+    let ratio = ((x as f32 - (bar_rect.left as f32 + pad_l)) / usable).clamp(0.0, 1.0);
+    (ratio * 100.0).round() as u8
+}
+
 fn register_window_class() {
     REGISTER_CLASS.call_once(|| {
         let class_name = win32::to_wide(FLYOUT_CLASS_NAME);
@@ -1811,8 +1897,10 @@ unsafe extern "system" fn flyout_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            let (x, y) = lparam_point(lparam);
             let post_action = {
                 let data = unsafe { &mut *ptr };
+                data.last_mouse = Some((x, y));
                 if data.dragging_volume.take().is_some() {
                     PostMsgAction::ReleaseCapture
                 } else {
@@ -1821,21 +1909,18 @@ unsafe extern "system" fn flyout_wnd_proc(
             };
             if matches!(post_action, PostMsgAction::ReleaseCapture) {
                 run_post_action(hwnd, post_action);
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowData;
+                if !ptr.is_null() {
+                    let data = unsafe { &mut *ptr };
+                    data.refresh(hwnd);
                 }
             }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            let had_drag = {
-                let data = unsafe { &mut *ptr };
-                data.dragging_volume.take().is_some()
-            };
-            if had_drag {
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+            let data = unsafe { &mut *ptr };
+            if data.dragging_volume.take().is_some() && !data.is_closing {
+                data.refresh(hwnd);
             }
             LRESULT(0)
         }
@@ -4215,6 +4300,56 @@ mod tests {
         } else {
             panic!("expected listen overlay layout");
         }
+
+        unsafe {
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn volume_drag_fast_path_updates_card_in_place() {
+        let state = sample_state();
+        let dc = unsafe { CreateCompatibleDC(None) };
+        let fonts = FontCache::new(1.0);
+
+        let mut layout = FlyoutLayout::compute(
+            dc,
+            &fonts,
+            &LayoutInput {
+                width: 468,
+                height: 600,
+                scale: 1.0,
+                state: &state,
+                active_tab: DeviceFlow::Output,
+                search_query: "",
+                listen_search_query: "",
+                active_overlay: &ActiveOverlay::None,
+                saving_profile: false,
+                confirm_quit: false,
+                device_scroll: 0,
+                config_scroll: 0,
+                profile_scroll: 0,
+                listen_scroll: 0,
+            },
+        );
+
+        let orig_bar = layout.slider_rect("out-1").expect("active slider rect");
+        assert_eq!(volume_from_bar_x(orig_bar, orig_bar.left, 1.0), 0);
+        assert_eq!(volume_from_bar_x(orig_bar, orig_bar.right, 1.0), 100);
+
+        let orig_rect = layout.card("out-1").expect("active card").card_rect;
+        let dirty = layout
+            .update_card_volume("out-1", 120, true)
+            .expect("active card updated");
+        assert_eq!(dirty, orig_rect.intersect(layout.list_viewport));
+        let updated = layout.card("out-1").expect("active card");
+        assert_eq!(updated.volume, 100);
+        assert!(updated.muted);
+        assert_eq!(updated.card_rect, orig_rect);
+
+        // Disabled and unknown devices are ignored by in-place drag updates.
+        assert!(layout.update_card_volume("out-2", 60, false).is_none());
+        assert!(layout.update_card_volume("missing", 50, false).is_none());
 
         unsafe {
             let _ = DeleteDC(dc);

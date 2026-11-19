@@ -390,6 +390,7 @@ fn set_auto_disable_enhancements_disables_all_devices_and_preserves_undo() {
             sys_fx_enabled: true,
             advanced_enabled: true,
             spatial_sound_enabled: true,
+            previous_spatial_format: None,
         })
     );
 
@@ -404,6 +405,7 @@ fn set_auto_disable_enhancements_disables_all_devices_and_preserves_undo() {
             sys_fx_enabled: true,
             advanced_enabled: true,
             spatial_sound_enabled: true,
+            previous_spatial_format: None,
         }
     );
     assert_eq!(hd660.previous_enhancements, None);
@@ -443,12 +445,13 @@ fn reenable_all_enhancements_restores_prior_flags_across_all_devices() {
         .iter()
         .map(|d| {
             let target = if d.enhancements.any_enabled() {
-                d.enhancements
+                d.enhancements.clone()
             } else {
                 EnhancementsState {
                     sys_fx_enabled: true,
                     advanced_enabled: true,
                     spatial_sound_enabled: false,
+                    previous_spatial_format: None,
                 }
             };
             (d.id.clone(), target)
@@ -478,6 +481,7 @@ fn reenable_all_enhancements_restores_prior_flags_across_all_devices() {
             sys_fx_enabled: false,
             advanced_enabled: true,
             spatial_sound_enabled: true,
+            previous_spatial_format: None,
         }
     );
 }
@@ -496,6 +500,7 @@ fn live_device(id: &str, name: &str, flow: DeviceFlow) -> AudioDevice {
             sys_fx_enabled: true,
             advanced_enabled: false,
             spatial_sound_enabled: false,
+            previous_spatial_format: None,
         },
         previous_enhancements: None,
         listen: (flow == DeviceFlow::Input).then(ListenConfig::default),
@@ -541,10 +546,11 @@ fn reconcile_live_devices_preserves_metadata_and_migrates_mock_profiles() {
         sys_fx_enabled: true,
         advanced_enabled: true,
         spatial_sound_enabled: true,
+        previous_spatial_format: None,
     };
     state.toggle_device_pin(real_out_2);
     if let Some(d) = state.devices.iter_mut().find(|d| d.id == real_out_2) {
-        d.previous_enhancements = Some(undo_enh);
+        d.previous_enhancements = Some(undo_enh.clone());
     }
     state.set_listen_enabled(real_in_1, true);
     state.set_listen_target(real_in_1, Some(LISTEN_TARGET_COMMS_OUTPUT.into()));
@@ -763,6 +769,7 @@ fn apply_action_updates_all_state_dimensions_consistently() {
             sys_fx_enabled: true,
             advanced_enabled: false,
             spatial_sound_enabled: false,
+            previous_spatial_format: None,
         }
     ));
     assert!(!state.set_device_enhancements(
@@ -771,6 +778,7 @@ fn apply_action_updates_all_state_dimensions_consistently() {
             sys_fx_enabled: true,
             advanced_enabled: false,
             spatial_sound_enabled: false,
+            previous_spatial_format: None,
         }
     ));
     assert!(state.set_device_listen(
@@ -1415,4 +1423,96 @@ fn reconcile_live_devices_preserves_listen_sentinels_accurately() {
             target_device_id: Some(out_other.into()),
         })
     );
+}
+
+#[test]
+fn previous_spatial_format_defaults_round_trips_reconciles_and_clears_on_undo() {
+    let dolby_guid = "{b53d940c-0102-4033-832d-19a81242006d}";
+    let sonic_guid = "{b53d940c-0102-4033-832d-19a81242006e}";
+
+    // Legacy EnhancementsState JSON without `previous_spatial_format` deserializes with None.
+    let legacy_json =
+        r#"{"sys_fx_enabled":true,"advanced_enabled":false,"spatial_sound_enabled":true}"#;
+    let legacy: EnhancementsState = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(
+        legacy,
+        EnhancementsState {
+            sys_fx_enabled: true,
+            advanced_enabled: false,
+            spatial_sound_enabled: true,
+            previous_spatial_format: None,
+        }
+    );
+
+    let out_id = "{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}";
+    let mut initial = live_device(out_id, "Headphones", DeviceFlow::Output);
+    initial.enhancements.spatial_sound_enabled = true;
+
+    let mut state = AppState {
+        devices: vec![initial],
+        roles: RoleAssignments {
+            default_output_id: out_id.into(),
+            comms_output_id: out_id.into(),
+            ..RoleAssignments::default()
+        },
+        ..AppState::default()
+    };
+
+    // Disable enhancements and record prior Spatial Sound format; repeated recording does not overwrite.
+    state.set_enhancements_disabled(out_id, true);
+    assert!(state.record_previous_spatial_format(out_id, dolby_guid.into()));
+    assert!(!state.record_previous_spatial_format(out_id, sonic_guid.into()));
+    assert_eq!(
+        state
+            .device(out_id)
+            .unwrap()
+            .enhancements
+            .previous_spatial_format
+            .as_deref(),
+        Some(dolby_guid)
+    );
+
+    // JSON round-trip preserves `previous_spatial_format`.
+    let serialized = serde_json::to_string(&state).unwrap();
+    let mut round_tripped: AppState = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(round_tripped, state);
+
+    // `set_device_enhancements` from live property notifications preserves `previous_spatial_format`.
+    assert!(!round_tripped.set_device_enhancements(out_id, EnhancementsState::all_disabled()));
+    assert_eq!(
+        round_tripped
+            .device(out_id)
+            .unwrap()
+            .enhancements
+            .previous_spatial_format
+            .as_deref(),
+        Some(dolby_guid)
+    );
+
+    // `reconcile_live_devices` preserves `previous_spatial_format` alongside `previous_enhancements`.
+    let mut live_after = live_device(out_id, "Headphones", DeviceFlow::Output);
+    live_after.enhancements = EnhancementsState::all_disabled();
+    round_tripped.reconcile_live_devices(vec![live_after], round_tripped.roles.clone());
+    let reconciled = round_tripped.device(out_id).unwrap();
+    assert!(reconciled.previous_enhancements.is_some());
+    assert_eq!(
+        reconciled.enhancements.previous_spatial_format.as_deref(),
+        Some(dolby_guid)
+    );
+
+    // Single-device undo restores `spatial_sound_enabled` and clears `previous_spatial_format`.
+    round_tripped.set_enhancements_disabled(out_id, false);
+    let restored = round_tripped.device(out_id).unwrap();
+    assert!(restored.enhancements.spatial_sound_enabled);
+    assert_eq!(restored.enhancements.previous_spatial_format, None);
+    assert_eq!(restored.previous_enhancements, None);
+
+    // `reenable_all_enhancements` also restores `spatial_sound_enabled` and clears `previous_spatial_format`
+    // even when `previous_enhancements` is None.
+    round_tripped.disable_all_enhancements(out_id);
+    assert!(round_tripped.record_previous_spatial_format(out_id, sonic_guid.into()));
+    round_tripped.reenable_all_enhancements();
+    let restored_all = round_tripped.device(out_id).unwrap();
+    assert!(restored_all.enhancements.spatial_sound_enabled);
+    assert_eq!(restored_all.enhancements.previous_spatial_format, None);
 }

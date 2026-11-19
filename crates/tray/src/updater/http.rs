@@ -93,6 +93,9 @@ pub fn validate_asset_url(asset_url: &str, manifest_url: &str) -> Result<(), Str
 }
 
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
+    if url.contains('\0') {
+        return Err("URL contains NUL byte".to_string());
+    }
     let url_utf16: Vec<u16> = url.encode_utf16().collect();
     if url_utf16.is_empty() {
         return Err("Empty URL".to_string());
@@ -470,5 +473,18 @@ mod tests {
             "http://127.0.0.1:8080/manifest.json"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rejects_embedded_nul_in_urls() {
+        match parse_url("https://github.com/a\0b") {
+            Ok(_) => panic!("URL with embedded NUL should be rejected"),
+            Err(err) => assert!(err.contains("NUL")),
+        }
+        assert!(parse_url("https://github.com\0.evil.example/app.zip").is_err());
+
+        let gh_manifest = "https://github.com/owner/repo/releases/latest/download/manifest.json";
+        assert!(validate_asset_url("https://github.com/a\0b", gh_manifest).is_err());
+        assert!(validate_asset_url(gh_manifest, "https://github.com/a\0b").is_err());
     }
 }

@@ -960,6 +960,7 @@ impl AudioWorker {
             sys_fx_enabled,
             advanced_enabled: false,
             spatial_sound_enabled,
+            previous_spatial_format: None,
         }
     }
 
@@ -1232,8 +1233,36 @@ impl AudioWorker {
         let defer_save = matches!(action, AppAction::SetVolume { .. });
         let mut previous_roles: Option<RoleAssignments> = None;
         let mut disable_accepted = true;
+        let mut spatial_formats_to_restore: Vec<(String, String)> = Vec::new();
         let mut snapshot = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match &action {
+                AppAction::SetEnhancementsDisabled {
+                    device_id,
+                    disabled: false,
+                } => {
+                    if let Some(dev) = guard.device(device_id)
+                        && !dev.enhancements.any_enabled()
+                        && !dev.disabled
+                        && dev.flow == DeviceFlow::Output
+                        && let Some(fmt) = saved_spatial_format(dev)
+                    {
+                        spatial_formats_to_restore.push((device_id.clone(), fmt.to_string()));
+                    }
+                }
+                AppAction::ReenableAllEnhancements => {
+                    for dev in &guard.devices {
+                        if !dev.enhancements.any_enabled()
+                            && !dev.disabled
+                            && dev.flow == DeviceFlow::Output
+                            && let Some(fmt) = saved_spatial_format(dev)
+                        {
+                            spatial_formats_to_restore.push((dev.id.clone(), fmt.to_string()));
+                        }
+                    }
+                }
+                _ => {}
+            }
             match &action {
                 AppAction::SetRunOnStartup(enabled) => {
                     if startup::set_enabled(*enabled).is_ok() {
@@ -1314,6 +1343,7 @@ impl AudioWorker {
                     if was_disabled || snapshot.auto_disable_unused_devices {
                         self.suppress_auto_enforce();
                     }
+                    let mut spatial_recorded = false;
                     if self.ensure_device_enabled(&device_id) {
                         self.set_default_endpoint_if_needed(flow, eConsole, &device_id);
                         self.set_default_endpoint_if_needed(flow, eMultimedia, &device_id);
@@ -1324,7 +1354,8 @@ impl AudioWorker {
                             }
                         }
                         if snapshot.auto_disable_enhancements {
-                            self.disable_device_enhancements(&device_id, flow, false);
+                            spatial_recorded =
+                                self.disable_device_enhancements(&device_id, flow, false);
                         }
                     }
                     let enforced = if snapshot.auto_disable_unused_devices {
@@ -1336,6 +1367,8 @@ impl AudioWorker {
                         snapshot = self.refresh_live_state_excluding_pending(&enforced.disabled_ids);
                     } else if !enforced.disabled_ids.is_empty() {
                         snapshot = self.mark_devices_disabled(&enforced.disabled_ids);
+                    } else if spatial_recorded {
+                        snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     }
                 }
             }
@@ -1346,13 +1379,15 @@ impl AudioWorker {
                     if was_disabled || snapshot.auto_disable_unused_devices {
                         self.suppress_auto_enforce();
                     }
+                    let mut spatial_recorded = false;
                     if self.ensure_device_enabled(&device_id) {
                         self.set_default_endpoint_if_needed(flow, eCommunications, &device_id);
                         if flow == DeviceFlow::Output {
                             self.resync_comms_listen_targets(&snapshot);
                         }
                         if snapshot.auto_disable_enhancements {
-                            self.disable_device_enhancements(&device_id, flow, false);
+                            spatial_recorded =
+                                self.disable_device_enhancements(&device_id, flow, false);
                         }
                     }
                     let enforced = if snapshot.auto_disable_unused_devices {
@@ -1364,6 +1399,8 @@ impl AudioWorker {
                         snapshot = self.refresh_live_state_excluding_pending(&enforced.disabled_ids);
                     } else if !enforced.disabled_ids.is_empty() {
                         snapshot = self.mark_devices_disabled(&enforced.disabled_ids);
+                    } else if spatial_recorded {
+                        snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     }
                 }
             }
@@ -1384,22 +1421,43 @@ impl AudioWorker {
                 device_id,
                 disabled,
             } => {
-                if let Some(dev) = snapshot.device(&device_id) {
+                if let Some((flow, dev_disabled, enable_sysfx)) = snapshot
+                    .device(&device_id)
+                    .map(|dev| {
+                        (
+                            dev.flow,
+                            dev.disabled,
+                            dev.enhancements.sys_fx_enabled || dev.enhancements.advanced_enabled,
+                        )
+                    })
+                {
                     if disabled {
-                        self.disable_device_enhancements(&device_id, dev.flow, dev.disabled);
-                    } else if dev.enhancements.sys_fx_enabled || dev.enhancements.advanced_enabled {
-                        self.enable_device_sysfx(&device_id);
+                        if self.disable_device_enhancements(&device_id, flow, dev_disabled) {
+                            snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        }
+                    } else {
+                        if enable_sysfx {
+                            self.enable_device_sysfx(&device_id);
+                        }
+                        for (id, fmt) in spatial_formats_to_restore {
+                            let _ = spatial::set_spatial_format(&id, &fmt);
+                        }
                     }
                 }
             }
             AppAction::SetAutoDisableEnhancements(true) => {
-                self.disable_all_active_enhancements(&snapshot);
+                if self.disable_all_active_enhancements(&snapshot) {
+                    snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                }
             }
             AppAction::ReenableAllEnhancements => {
                 for dev in &snapshot.devices {
                     if dev.enhancements.sys_fx_enabled || dev.enhancements.advanced_enabled {
                         self.enable_device_sysfx(&dev.id);
                     }
+                }
+                for (id, fmt) in spatial_formats_to_restore {
+                    let _ = spatial::set_spatial_format(&id, &fmt);
                 }
             }
             AppAction::ToggleDevicePin { .. } | AppAction::SetDevicePinned { .. } => {
@@ -1768,9 +1826,8 @@ impl AudioWorker {
                 if active
                     && device.flow == DeviceFlow::Output
                     && !device.enhancements.spatial_sound_enabled
-                    && spatial::is_spatial_enabled(&device.id)
                 {
-                    spatial::disable_spatial(&device.id);
+                    self.disable_device_spatial(&device.id);
                 }
             }
 
@@ -1867,10 +1924,30 @@ impl AudioWorker {
         }
     }
 
-    fn disable_device_enhancements(&self, device_id: &str, flow: DeviceFlow, disabled: bool) {
+    fn disable_device_spatial(&mut self, device_id: &str) -> bool {
+        let Some(prev_format) = spatial::disable_spatial(device_id) else {
+            return false;
+        };
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.record_previous_spatial_format(device_id, prev_format) {
+            self.save_due = None;
+            let _ = store::save_state(&guard);
+            return true;
+        }
+        false
+    }
+
+    fn disable_device_enhancements(
+        &mut self,
+        device_id: &str,
+        flow: DeviceFlow,
+        disabled: bool,
+    ) -> bool {
         self.disable_device_sysfx(device_id);
-        if !disabled && flow == DeviceFlow::Output && spatial::is_spatial_enabled(device_id) {
-            spatial::disable_spatial(device_id);
+        if !disabled && flow == DeviceFlow::Output {
+            self.disable_device_spatial(device_id)
+        } else {
+            false
         }
     }
 
@@ -1885,10 +1962,14 @@ impl AudioWorker {
         }
     }
 
-    fn disable_all_active_enhancements(&self, state: &AppState) {
+    fn disable_all_active_enhancements(&mut self, state: &AppState) -> bool {
+        let mut recorded_any = false;
         for dev in &state.devices {
-            self.disable_device_enhancements(&dev.id, dev.flow, dev.disabled);
+            if self.disable_device_enhancements(&dev.id, dev.flow, dev.disabled) {
+                recorded_any = true;
+            }
         }
+        recorded_any
     }
 
     fn apply_listen_config(&self, device_id: &str, listen: &ListenConfig, state: &AppState) {
@@ -1937,6 +2018,19 @@ impl AudioWorker {
             }
         }
     }
+}
+
+fn saved_spatial_format(device: &AudioDevice) -> Option<&str> {
+    device
+        .enhancements
+        .previous_spatial_format
+        .as_deref()
+        .or_else(|| {
+            device
+                .previous_enhancements
+                .as_ref()
+                .and_then(|prev| prev.previous_spatial_format.as_deref())
+        })
 }
 
 fn earliest_deadline<const N: usize>(deadlines: [Option<Instant>; N]) -> Option<Instant> {

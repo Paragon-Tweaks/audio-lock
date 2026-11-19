@@ -32,11 +32,13 @@ pub enum EnhancementLayer {
     Spatial,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EnhancementsState {
     pub sys_fx_enabled: bool,
     pub advanced_enabled: bool,
     pub spatial_sound_enabled: bool,
+    #[serde(default)]
+    pub previous_spatial_format: Option<String>,
 }
 
 impl EnhancementsState {
@@ -230,7 +232,11 @@ impl AppState {
         for device in &mut live_devices {
             if let Some(existing) = self.device(&device.id) {
                 device.pinned = existing.pinned;
-                device.previous_enhancements = existing.previous_enhancements;
+                device.previous_enhancements = existing.previous_enhancements.clone();
+                if device.enhancements.previous_spatial_format.is_none() {
+                    device.enhancements.previous_spatial_format =
+                        existing.enhancements.previous_spatial_format.clone();
+                }
                 if device.disabled {
                     device.volume = existing.volume;
                     device.muted = existing.muted;
@@ -316,15 +322,30 @@ impl AppState {
     pub fn set_device_enhancements(
         &mut self,
         device_id: &str,
-        enhancements: EnhancementsState,
+        mut enhancements: EnhancementsState,
     ) -> bool {
         let Some(device) = self.device_mut(device_id) else {
             return false;
         };
+        if enhancements.previous_spatial_format.is_none() {
+            enhancements.previous_spatial_format =
+                device.enhancements.previous_spatial_format.clone();
+        }
         if device.enhancements == enhancements {
             return false;
         }
         device.enhancements = enhancements;
+        true
+    }
+
+    pub fn record_previous_spatial_format(&mut self, device_id: &str, format: String) -> bool {
+        let Some(device) = self.device_mut(device_id) else {
+            return false;
+        };
+        if device.enhancements.previous_spatial_format.is_some() {
+            return false;
+        }
+        device.enhancements.previous_spatial_format = Some(format);
         true
     }
 
@@ -663,7 +684,13 @@ impl AppState {
             if let Some(device) = self.device_mut(&snapshot.device_id) {
                 device.volume = snapshot.volume.min(100);
                 device.muted = snapshot.muted;
+                let saved_spatial = device.enhancements.previous_spatial_format.clone();
                 device.enhancements = snapshot.enhancements;
+                if !device.enhancements.spatial_sound_enabled
+                    && device.enhancements.previous_spatial_format.is_none()
+                {
+                    device.enhancements.previous_spatial_format = saved_spatial;
+                }
                 if device.flow == DeviceFlow::Input {
                     device.listen = Some(snapshot.listen.unwrap_or_default());
                 } else {
@@ -807,7 +834,7 @@ impl AppState {
                 device_id: d.id.clone(),
                 volume: d.volume,
                 muted: d.muted,
-                enhancements: d.enhancements,
+                enhancements: d.enhancements.clone(),
                 listen: d.listen.clone(),
             })
             .collect()
@@ -846,14 +873,15 @@ impl AppState {
 
 fn disable_enhancements_preserving_undo(device: &mut AudioDevice) {
     if device.enhancements.any_enabled() {
-        device.previous_enhancements = Some(device.enhancements);
+        device.previous_enhancements = Some(device.enhancements.clone());
         device.enhancements.disable_all();
     }
 }
 
 fn reenable_enhancements_from_undo(device: &mut AudioDevice) {
     if !device.enhancements.any_enabled() {
-        device.enhancements = device
+        let had_spatial_format = device.enhancements.previous_spatial_format.is_some();
+        let mut restored = device
             .previous_enhancements
             .take()
             .filter(|prev| prev.any_enabled())
@@ -861,7 +889,13 @@ fn reenable_enhancements_from_undo(device: &mut AudioDevice) {
                 sys_fx_enabled: true,
                 advanced_enabled: true,
                 spatial_sound_enabled: false,
+                previous_spatial_format: None,
             });
+        if had_spatial_format {
+            restored.spatial_sound_enabled = true;
+        }
+        restored.previous_spatial_format = None;
+        device.enhancements = restored;
     }
 }
 

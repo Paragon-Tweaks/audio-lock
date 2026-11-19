@@ -443,6 +443,25 @@ impl FlyoutLayout {
             .map(|c| c.volume_bar)
     }
 
+    pub fn card(&self, device_id: &str) -> Option<&DeviceCardLayout> {
+        self.cards.iter().find(|c| c.device_id == device_id)
+    }
+
+    pub fn update_card_volume(
+        &mut self,
+        device_id: &str,
+        volume: u8,
+        muted: bool,
+    ) -> Option<RectPx> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|c| c.device_id == device_id && !c.disabled)?;
+        card.volume = volume.min(100);
+        card.muted = muted;
+        Some(card.card_rect.intersect(self.list_viewport))
+    }
+
     pub fn overlay_max_scroll(&self) -> i32 {
         match &self.overlay {
             OverlayLayout::None => 0,
