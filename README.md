@@ -1,21 +1,37 @@
-# Audio Lock
+<a href="https://paragontweaks.net">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/banner-light.svg" />
+    <img alt="Paragon Tweaks" src="assets/banner-light.svg" width="100%" />
+  </picture>
+</a>
 
-by [Paragon Tweaks](https://paragontweaks.net)
+> Built by **[Paragon Tweaks](https://paragontweaks.net)**. Want full-system FPS, latency, BIOS, and network tuning beyond audio? Check out **[PTU (Paragon Tweaking Utility)](https://paragontweaks.net/utilities)** at https://paragontweaks.net/utilities.
+
+# Audio Lock
 
 [![Latest Release](https://img.shields.io/github/v/release/Paragon-Tweaks/audio-lock?style=flat-square&color=1f1f1f&labelColor=111111&label=Release)](https://github.com/Paragon-Tweaks/audio-lock/releases/latest)
 [![License](https://img.shields.io/badge/License-GPLv3-1f1f1f?style=flat-square&labelColor=111111)](LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-1f1f1f?style=flat-square&labelColor=111111)
 ![Binary Size](https://img.shields.io/badge/Binary%20Size-1.39%20MB-1f1f1f?style=flat-square&labelColor=111111)
 
-Lock your Windows default audio devices, mute both microphones from the tray, disable audio enhancements, and hot-swap profiles in a single 1.39 MB pure-Rust Win32 executable with 0.00% idle CPU and zero GPU usage.
-
-## Download
+Keep your Windows speakers and microphone locked where you want them, mute your mic from the taskbar, turn off hidden Windows sound effects, and hot-swap audio profiles in a single 1.39 MB app that uses 0% CPU while you play.
 
 **[Download Latest Release (`DefaultAudioLock-Setup.exe`)](https://github.com/Paragon-Tweaks/audio-lock/releases/latest)**
 
 Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights or UAC prompt required.
 
 <!-- SCREENSHOTS: Add Dark and Light flyout showcase screenshots here once captured -->
+
+## What It Does
+
+- **Lock your audio defaults**: Stops Windows, game updates, monitor wakes, and USB headsets from randomly hijacking your speakers or mic.
+- **One-click mic mute from your taskbar**: White mic outline means live, red inside means muted. Left-click mutes both your Default and Communications mics at once.
+- **Hide unused audio devices automatically**: Disables every device you are not using (while keeping your pinned favorites enabled) so apps like Discord, OBS, or Krisp never grab the wrong mic.
+- **Turn off Windows audio enhancements in one click**: Disables the hidden Windows sound effects and Spatial Sound that muddy game audio, with one-click undo and an automatic option for new devices.
+- **Hot-swap audio profiles**: Switch between Gaming, Streaming, Speakers, or Work setups from the flyout or the instant right-click tray menu.
+- **Safe "Listen to this device" monitoring**: Hear your mic through any playback device with a searchable dropdown that defaults to `None` so you never blast feedback by accident.
+- **Stays out of your way while gaming**: Uses ~1.2 MB of RAM, 0% CPU when idle, and zero GPU memory. Auto-updates silently in the background only after your PC sits idle for 5 minutes.
 
 ## Measured Performance (`--release`)
 
@@ -28,22 +44,13 @@ Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights
 | **Priority** | `BelowNormal` + Windows Efficiency Mode (`EcoQoS`) |
 | **OS Dependencies** | Zero WebView2, zero .NET, zero Windows Services or Task Scheduler (works on stripped/tweaked Windows builds) |
 
-## Features
+## Technical Breakdown
 
-- **Event-driven Default & Communications audio locking**: CoreAudio COM callbacks catch Windows, USB hot-plug, and driver updates immediately. Uses unified Default + Communications locking by default, with an optional separate Default/Comms mode in Settings.
-- **Instant mic-mute tray icon**: Crisp microphone status in the tray (white outline when live, red capsule fill when muted). Left-click toggles mute on both Default and Communications microphones at once.
-- **Automatic unused-device disabling**: Keeps your Default, Comms, pinned devices, and active Listen targets enabled while disabling unused endpoints so apps like Krisp never grab the wrong mic.
-- **One-click and automatic audio enhancement disabling**: Turns off Enhancements tab SysFx, the Advanced tab checkbox, and Windows Spatial Sound, with undo support and bulk re-enable.
-- **`Listen to this device` routing**: Searchable playback dropdown defaulting safely to `None`, with `Default Playback Device` and `Default Communications Device` pinned at the top.
-- **Instant pure-Win32 menu and flyout**: Responsive right-click context menu and monochrome Dark/Light flyout with hot-swap profiles, per-device pinning, live search, and 26 px tactile volume bars.
-- **Zero-hook automatic GitHub Releases updater**: Uses native `WinHTTP` and `BCrypt` SHA-256 verification. Staged updates restart automatically only after 5 minutes of mouse and keyboard inactivity via `GetLastInputInfo`.
-- **Non-elevated per-user install and startup**: Installs per-user and registers optional autostart via `HKCU\...\Run` with no background service or scheduled task.
-
-## Built by Paragon Tweaks
-
-Built by [Paragon Tweaks](https://paragontweaks.net). Want full-system FPS, latency, BIOS, and network tuning beyond audio? Check out [PTU (Paragon Tweaking Utility)](https://paragontweaks.net/utilities).
-
-Audio Lock is the first tool in Paragon Tweaks' free, open-source QoL suite.
+- **CoreAudio event locking**: Hooks `IMMNotificationClient` and enforces defaults via `IPolicyConfig` as soon as Windows, a USB hot-plug, or a driver update switches endpoints. Defaults to unified Default + Communications locking, with an optional split Default/Comms mode in Settings.
+- **Pure-Win32 UI**: Rendered directly to GDI/DIB buffers with ClearType text (no WebView2, no D3D11/DXGI, no GPU context). Includes a monochrome Dark/Light flyout with live search, per-device pinning, and 26 px volume bars, alongside an instant native right-click tray menu.
+- **Endpoint and enhancement control**: Disables unused endpoints while keeping Default, Communications, pinned devices, and active Listen targets enabled. Toggles Enhancements tab SysFx, the Advanced tab enhancement checkbox, and Windows Spatial Sound with undo and bulk re-enable.
+- **Zero-hook silent updater**: Checks GitHub Releases using native `WinHTTP`, validates archives with `BCrypt` SHA-256 verification, and restarts staged updates via `GetLastInputInfo` only after 5 minutes of mouse and keyboard inactivity.
+- **Per-user install and startup**: Installs to `%LOCALAPPDATA%\Programs\DefaultAudioLock` and registers optional autostart via `HKCU\...\Run`. Requires no elevation, no Windows Services, and no Task Scheduler entries.
 
 ## Building from Source & Releasing
 
