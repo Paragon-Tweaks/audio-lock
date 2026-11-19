@@ -88,10 +88,10 @@ Requires Rust 1.85+ (stable toolchain, `x86_64-pc-windows-msvc`).
 
 ### Unsigned Local Test Build
 
-Use `scripts\build-unsigned.ps1` for fast local iteration without a code-signing token. It runs `clippy` and unit tests (skip with `-SkipChecks`), clears Authenticode signature requirements for test builds, and builds `target\release\default-audio-lock.exe`:
+Double-click `scripts\build-unsigned.bat` in Windows Explorer or run `scripts\build-unsigned.ps1` in PowerShell for fast local iteration without a code-signing token. It runs `clippy` and unit tests (skip with `-SkipChecks`), clears Authenticode signature requirements for test builds, and builds `target\release\default-audio-lock.exe`:
 
 ```powershell
-# Run checks and build unsigned release binary
+# Double-click scripts\build-unsigned.bat, or run in PowerShell:
 .\scripts\build-unsigned.ps1
 
 # Fast iteration (skip clippy/tests)
@@ -105,15 +105,19 @@ Use `scripts\build-unsigned.ps1` for fast local iteration without a code-signing
 
 Official releases are Authenticode-signed locally using a Sectigo hardware code-signing token (`signtool.exe` from the Windows 10/11 SDK), Inno Setup 6 (`winget install JRSoftware.InnoSetup`), and GitHub CLI (`gh`).
 
+You can either double-click the batch launchers in Windows Explorer (`scripts\build-signed-local.bat` to build, sign, and verify locally without publishing; `scripts\build-and-release.bat` to build, sign, tag, and publish after a confirmation prompt) or invoke `scripts\build-release.ps1` directly in PowerShell with custom flags.
+
 `scripts\build-release.ps1` validates the version against `Cargo.toml`, runs `clippy` and unit tests, compiles with strict Authenticode updater verification enabled, signs and verifies both `default-audio-lock.exe` and `DefaultAudioLock-Setup-<version>.exe`, generates `dist\default-audio-lock-win64-update.zip` and `dist\manifest.json`, pushes the `v<version>` tag, and creates the GitHub Release:
 
 ```powershell
+# Double-click scripts\build-signed-local.bat, or run in PowerShell:
 # Build, sign, package, and verify locally in dist\ without tagging or publishing
 .\scripts\build-release.ps1 -NoPublish
 
 # Publish as a draft GitHub Release
 .\scripts\build-release.ps1 -Draft
 
+# Double-click scripts\build-and-release.bat, or run in PowerShell:
 # Full signed release & publish (optional: pass -CertSubject "Tulantro LLC" or -CertSha1 <thumbprint>)
 .\scripts\build-release.ps1
 ```
