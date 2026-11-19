@@ -15,7 +15,42 @@ Keep your Windows speakers and microphone locked where you want them, mute your 
 
 Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights or UAC prompt required.
 
-<!-- SCREENSHOTS: Add Dark and Light flyout showcase screenshots here once captured -->
+<table>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="assets/screenshots/flyout-dark.png" alt="Audio Lock flyout in Dark Mode" width="275" /><br />
+      <sub><strong>Dark Mode</strong></sub>
+    </td>
+    <td align="center" colspan="2">
+      <img src="assets/screenshots/flyout-light.png" alt="Audio Lock flyout in Light Mode" width="275" /><br />
+      <sub><strong>Light Mode</strong></sub>
+    </td>
+    <td align="center" colspan="2">
+      <img src="assets/screenshots/flyout-settings.png" alt="Audio Lock flyout Settings view" width="275" /><br />
+      <sub><strong>Settings</strong></sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="3">
+      <img src="assets/screenshots/menu-dark.png" alt="Audio Lock right-click quick menu in Dark Mode" width="260" /><br />
+      <sub><strong>Quick Menu (Dark)</strong></sub>
+    </td>
+    <td align="center" colspan="3">
+      <img src="assets/screenshots/menu-light.png" alt="Audio Lock right-click quick menu in Light Mode" width="260" /><br />
+      <sub><strong>Quick Menu (Light)</strong></sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="3">
+      <img src="assets/screenshots/tray-live.png" alt="Windows taskbar tray icon hover tooltip showing mic live" width="300" /><br />
+      <sub><strong>Tray Hover (Mic Live)</strong></sub>
+    </td>
+    <td align="center" colspan="3">
+      <img src="assets/screenshots/tray-muted.png" alt="Windows taskbar tray icon hover tooltip showing mic muted" width="300" /><br />
+      <sub><strong>Tray Hover (Mic Muted)</strong></sub>
+    </td>
+  </tr>
+</table>
 
 ## What It Does
 
@@ -42,7 +77,7 @@ Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights
 
 - **CoreAudio event locking**: Hooks `IMMNotificationClient` and enforces defaults via `IPolicyConfig` as soon as Windows, a USB hot-plug, or a driver update switches endpoints. Defaults to unified Default + Communications locking, with an optional split Default/Comms toggle in Settings (off by default).
 - **Pure-Win32 UI**: Rendered directly to GDI/DIB buffers with ClearType text (no WebView2, no D3D11/DXGI, no GPU context). Includes a monochrome Dark/Light flyout with live search, per-device pinning, and 26 px volume bars, alongside an instant native right-click tray menu.
-- **Endpoint and enhancement control**: Optionally disables unused endpoints via Settings (off by default) while keeping Default, Communications, pinned devices, and active Listen targets enabled. Disables Enhancements tab `SysFx`, the Advanced tab enhancement checkbox, and Windows Spatial Sound, with one-click undo restoring prior `SysFx` settings, bulk re-enable, and an optional auto-disable toggle in Settings (off by default).
+- **Endpoint and enhancement control**: Optionally disables unused endpoints via Settings (off by default) while keeping Default, Communications, pinned devices, and active Listen targets enabled. Disables Windows audio enhancements (`PKEY_AudioEndpoint_Disable_SysFx`) and turns off Windows Spatial Sound, with one-click undo restoring prior `SysFx` settings, bulk re-enable, and an optional auto-disable toggle in Settings (off by default).
 - **Zero-hook silent updater**: Checks GitHub Releases using native `WinHTTP`, validates archives with `BCrypt` SHA-256 verification, and restarts staged updates via `GetLastInputInfo` and `SHQueryUserNotificationState` only when the PC is genuinely idle for 5 minutes, never interrupting fullscreen games or active controller sessions.
 - **Per-user install and startup**: Installs to `%LOCALAPPDATA%\Programs\DefaultAudioLock` and registers optional autostart via `HKCU\...\Run`. Requires no elevation, no Windows Services, and no Task Scheduler entries.
 
