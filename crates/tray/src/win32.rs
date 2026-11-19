@@ -4,27 +4,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{SETPROCESSWORKINGSETSIZEEX_FLAGS, SetProcessWorkingSetSizeEx};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, CreateMutexW, GetCurrentProcess, GetCurrentThread,
+    BELOW_NORMAL_PRIORITY_CLASS, CreateMutexW, GetCurrentProcess, GetCurrentThread, OpenProcess,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetPriorityClass,
-    SetProcessInformation, SetThreadPriority, THREAD_PRIORITY_IDLE,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_SYNCHRONIZE, ProcessPowerThrottling, SetPriorityClass,
+    SetProcessInformation, SetThreadPriority, THREAD_PRIORITY_IDLE, WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, HWND_MESSAGE, KillTimer,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_USER, WNDCLASSW,
+use windows::Win32::UI::Shell::{
+    QUNS_ACCEPTS_NOTIFICATIONS, QUNS_NOT_PRESENT, SHQueryUserNotificationState,
 };
-use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, KillTimer, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetTimer, WM_SETTINGCHANGE, WM_USER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+};
+use windows::core::{PCWSTR, w};
 
 pub const WM_APP_REFRESH_TRAY: u32 = WM_USER + 1;
 pub const WM_APP_TRAY_EVENT: u32 = WM_USER + 2;
@@ -35,6 +40,7 @@ pub const WM_APP_UPDATE_STAGED: u32 = WM_USER + 6;
 pub const WM_APP_APPLY_UPDATE: u32 = WM_USER + 7;
 pub const WM_APP_CHECK_UPDATES: u32 = WM_USER + 8;
 pub const WM_APP_FLYOUT_ACTION: u32 = WM_USER + 9;
+pub const WM_APP_THEME_CHANGED: u32 = WM_USER + 10;
 
 const MUTEX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -127,10 +133,48 @@ pub fn idle_duration_ms() -> u32 {
         dwTime: 0,
     };
     if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
-        unsafe { GetTickCount() }.wrapping_sub(info.dwTime)
+        let diff = unsafe { GetTickCount() }.wrapping_sub(info.dwTime) as i32;
+        if diff <= 0 { 0 } else { diff as u32 }
     } else {
         0
     }
+}
+
+pub fn is_fullscreen_or_busy() -> bool {
+    match unsafe { SHQueryUserNotificationState() } {
+        Ok(state) => state != QUNS_ACCEPTS_NOTIFICATIONS && state != QUNS_NOT_PRESENT,
+        Err(_) => false,
+    }
+}
+
+pub fn wait_for_pid_exit(pid: u32, timeout_ms: u64) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    let timeout = u32::try_from(timeout_ms).unwrap_or(u32::MAX - 1);
+    unsafe {
+        if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            let _ = WaitForSingleObject(handle, timeout);
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+pub fn is_system_light_taskbar() -> bool {
+    let mut value: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast::<c_void>()),
+            Some(&mut size),
+        )
+    };
+    status == ERROR_SUCCESS && value == 1
 }
 
 pub fn set_timer(hwnd: HWND, id: usize, interval_ms: u32) {
@@ -190,15 +234,15 @@ impl MessageWindow {
             RegisterClassW(&wc);
 
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR::null(),
-                WINDOW_STYLE(0),
+                WS_POPUP,
                 0,
                 0,
                 0,
                 0,
-                Some(HWND_MESSAGE),
+                None,
                 None,
                 Some(hinstance.into()),
                 None,
@@ -230,5 +274,10 @@ unsafe extern "system" fn message_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_SETTINGCHANGE {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_THEME_CHANGED, WPARAM(0), LPARAM(0));
+        }
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }

@@ -11,8 +11,9 @@ pub enum DeviceFlow {
     Input,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ThemeMode {
+    #[default]
     Dark,
     Light,
 }
@@ -93,7 +94,7 @@ pub struct DeviceSnapshot {
     pub listen: Option<ListenConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoleAssignments {
     pub default_output_id: String,
     pub comms_output_id: String,
@@ -137,12 +138,38 @@ fn default_true() -> bool {
     true
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            lock_enabled: true,
+            theme: ThemeMode::Dark,
+            separate_comms_role: false,
+            right_click_action: RightClickAction::default(),
+            run_on_startup: false,
+            auto_update: true,
+            staged_update_version: None,
+            auto_disable_enhancements: false,
+            auto_disable_unused_devices: false,
+            active_profile_id: None,
+            roles: RoleAssignments::default(),
+            devices: Vec::new(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
 impl AppState {
     pub fn apply_action(&mut self, action: &AppAction) {
         match action {
             AppAction::SetLockEnabled(enabled) => self.lock_enabled = *enabled,
             AppAction::SetTheme(theme) => self.theme = *theme,
-            AppAction::SetSeparateCommsRole(enabled) => self.separate_comms_role = *enabled,
+            AppAction::SetSeparateCommsRole(enabled) => {
+                self.separate_comms_role = *enabled;
+                if !*enabled {
+                    self.unify_comms_roles();
+                    self.sync_auto_disabled_flags();
+                }
+            }
             AppAction::SetRightClickAction(right_click) => self.right_click_action = *right_click,
             AppAction::SetRunOnStartup(enabled) => self.run_on_startup = *enabled,
             AppAction::SetAutoUpdate(enabled) => self.auto_update = *enabled,
@@ -167,11 +194,15 @@ impl AppState {
             AppAction::SetComms { flow, device_id } => self.set_comms(*flow, device_id),
             AppAction::SetVolume { device_id, volume } => self.set_volume(device_id, *volume),
             AppAction::ToggleMute { device_id } => self.toggle_mute(device_id),
+            AppAction::SetMute { device_id, muted } => self.set_mute(device_id, *muted),
             AppAction::SetEnhancementsDisabled {
                 device_id,
                 disabled,
             } => self.set_enhancements_disabled(device_id, *disabled),
             AppAction::ToggleDevicePin { device_id } => self.toggle_device_pin(device_id),
+            AppAction::SetDevicePinned { device_id, pinned } => {
+                self.set_device_pinned(device_id, *pinned);
+            }
             AppAction::SetListenEnabled { device_id, enabled } => {
                 self.set_listen_enabled(device_id, *enabled);
             }
@@ -207,16 +238,23 @@ impl AppState {
                 if let (Some(existing_listen), Some(live_listen)) =
                     (existing.listen.as_ref(), device.listen.as_mut())
                 {
-                    if existing_listen.target_device_id.as_deref()
-                        == Some(LISTEN_TARGET_COMMS_OUTPUT)
-                        && live_listen.enabled
+                    if live_listen.enabled {
+                        if existing_listen.target_device_id.as_deref()
+                            == Some(LISTEN_TARGET_COMMS_OUTPUT)
+                            && !self.roles.comms_output_id.is_empty()
+                            && live_listen.target_device_id.as_deref()
+                                == Some(self.roles.comms_output_id.as_str())
+                        {
+                            live_listen.target_device_id =
+                                Some(LISTEN_TARGET_COMMS_OUTPUT.to_string());
+                        }
+                    } else if matches!(
+                        existing_listen.target_device_id.as_deref(),
+                        Some(LISTEN_TARGET_DEFAULT_OUTPUT | LISTEN_TARGET_COMMS_OUTPUT)
+                    ) {
+                        live_listen.target_device_id = existing_listen.target_device_id.clone();
+                    } else if existing_listen.enabled && existing_listen.target_device_id.is_none()
                     {
-                        live_listen.target_device_id = Some(LISTEN_TARGET_COMMS_OUTPUT.to_string());
-                    } else if existing_listen.enabled
-                        && existing_listen.target_device_id.is_none()
-                        && !live_listen.enabled
-                    {
-                        live_listen.enabled = false;
                         live_listen.target_device_id = None;
                     }
                 }
@@ -224,31 +262,35 @@ impl AppState {
         }
 
         self.devices = live_devices;
+        let has_real_devices = self.devices.iter().any(|d| d.id.starts_with('{'));
 
         self.roles = RoleAssignments {
             default_output_id: self.reconcile_role(
                 DeviceFlow::Output,
                 &self.roles.default_output_id,
                 &live_roles.default_output_id,
+                has_real_devices,
             ),
             comms_output_id: self.reconcile_role(
                 DeviceFlow::Output,
                 &self.roles.comms_output_id,
                 &live_roles.comms_output_id,
+                has_real_devices,
             ),
             default_input_id: self.reconcile_role(
                 DeviceFlow::Input,
                 &self.roles.default_input_id,
                 &live_roles.default_input_id,
+                has_real_devices,
             ),
             comms_input_id: self.reconcile_role(
                 DeviceFlow::Input,
                 &self.roles.comms_input_id,
                 &live_roles.comms_input_id,
+                has_real_devices,
             ),
         };
 
-        let has_real_devices = self.devices.iter().any(|d| d.id.starts_with('{'));
         if has_real_devices
             && !self.profiles.is_empty()
             && self.profiles.iter().all(is_mock_only_profile)
@@ -361,6 +403,12 @@ impl AppState {
         }
     }
 
+    pub fn set_mute(&mut self, device_id: &str, muted: bool) {
+        if let Some(device) = self.device_mut(device_id) {
+            device.muted = muted;
+        }
+    }
+
     pub fn are_active_mics_muted(&self) -> bool {
         let mut active = self.devices.iter().filter(|d| {
             d.flow == DeviceFlow::Input
@@ -388,6 +436,15 @@ impl AppState {
     pub fn toggle_device_pin(&mut self, device_id: &str) {
         if let Some(device) = self.device_mut(device_id) {
             device.pinned = !device.pinned;
+        }
+        if self.auto_disable_unused_devices {
+            self.sync_auto_disabled_flags();
+        }
+    }
+
+    pub fn set_device_pinned(&mut self, device_id: &str, pinned: bool) {
+        if let Some(device) = self.device_mut(device_id) {
+            device.pinned = pinned;
         }
         if self.auto_disable_unused_devices {
             self.sync_auto_disabled_flags();
@@ -445,10 +502,44 @@ impl AppState {
         }
     }
 
-    pub fn set_device_disabled(&mut self, device_id: &str, disabled: bool) {
-        if let Some(device) = self.device_mut(device_id) {
-            device.disabled = disabled;
+    pub fn set_device_disabled(&mut self, device_id: &str, disabled: bool) -> bool {
+        let Some(flow) = self.device(device_id).map(|d| d.flow) else {
+            return false;
+        };
+        if disabled {
+            let Some(replacement_id) = self
+                .devices
+                .iter()
+                .find(|d| d.flow == flow && d.id != device_id && !d.disabled)
+                .map(|d| d.id.clone())
+            else {
+                return false;
+            };
+            if let Some(device) = self.device_mut(device_id) {
+                device.disabled = true;
+            }
+            match flow {
+                DeviceFlow::Output => {
+                    if self.roles.default_output_id == device_id {
+                        self.roles.default_output_id = replacement_id.clone();
+                    }
+                    if self.roles.comms_output_id == device_id {
+                        self.roles.comms_output_id = replacement_id;
+                    }
+                }
+                DeviceFlow::Input => {
+                    if self.roles.default_input_id == device_id {
+                        self.roles.default_input_id = replacement_id.clone();
+                    }
+                    if self.roles.comms_input_id == device_id {
+                        self.roles.comms_input_id = replacement_id;
+                    }
+                }
+            }
+        } else if let Some(device) = self.device_mut(device_id) {
+            device.disabled = false;
         }
+        true
     }
 
     pub fn set_auto_disable_unused_devices(&mut self, enabled: bool) {
@@ -553,6 +644,9 @@ impl AppState {
         };
 
         self.roles = profile.roles;
+        if !self.separate_comms_role {
+            self.unify_comms_roles();
+        }
         for role_id in [
             self.roles.default_output_id.clone(),
             self.roles.comms_output_id.clone(),
@@ -665,9 +759,32 @@ impl AppState {
         self.profiles.iter().find(|p| p.id == id)
     }
 
-    fn reconcile_role(&self, flow: DeviceFlow, stored_id: &str, live_id: &str) -> String {
-        if self.lock_enabled && !stored_id.is_empty() && self.has_device_with_flow(flow, stored_id) {
-            return stored_id.to_string();
+    fn unify_comms_roles(&mut self) {
+        self.roles.comms_output_id = self.roles.default_output_id.clone();
+        self.roles.comms_input_id = self.roles.default_input_id.clone();
+    }
+
+    fn reconcile_role(
+        &self,
+        flow: DeviceFlow,
+        stored_id: &str,
+        live_id: &str,
+        has_real_devices: bool,
+    ) -> String {
+        if self.lock_enabled && !stored_id.is_empty() {
+            let is_legacy_mock = !stored_id.starts_with('{') && has_real_devices;
+            if !is_legacy_mock {
+                match self
+                    .devices
+                    .iter()
+                    .find(|d| d.id == stored_id && d.flow == flow)
+                {
+                    Some(device) if !device.disabled => return stored_id.to_string(),
+                    Some(_) => {}
+                    None if stored_id.starts_with('{') => return stored_id.to_string(),
+                    None => {}
+                }
+            }
         }
         if !live_id.is_empty() {
             return live_id.to_string();

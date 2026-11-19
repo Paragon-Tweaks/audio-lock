@@ -4,8 +4,7 @@ use crate::model::{AppState, DeviceFlow, RightClickAction, ThemeMode};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\default-audio-lock-ipc";
 pub const TRAY_MUTEX_NAME: &str = "Local\\DefaultAudioLockTrayDaemon";
-pub const UI_MUTEX_NAME: &str = "Local\\DefaultAudioLockUiInstance";
-pub const UI_CLOSE_EVENT_NAME: &str = "Local\\DefaultAudioLockUiCloseEvent";
+pub const QUIT_EVENT_NAME: &str = "Local\\DefaultAudioLockQuitEvent";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppAction {
@@ -40,12 +39,20 @@ pub enum AppAction {
     ToggleMute {
         device_id: String,
     },
+    SetMute {
+        device_id: String,
+        muted: bool,
+    },
     SetEnhancementsDisabled {
         device_id: String,
         disabled: bool,
     },
     ToggleDevicePin {
         device_id: String,
+    },
+    SetDevicePinned {
+        device_id: String,
+        pinned: bool,
     },
     SetListenEnabled {
         device_id: String,
@@ -69,7 +76,6 @@ pub enum AppAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IpcRequest {
     GetState,
-    SyncState(AppState),
     ApplyAction(AppAction),
     Ping,
     OpenFlyout {

@@ -2,16 +2,16 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio_lock_core::fake_data::default_mock_state;
-use audio_lock_core::ipc::{AppAction, IpcRequest, IpcResponse};
+use audio_lock_core::ipc::{AppAction, IpcRequest, IpcResponse, QUIT_EVENT_NAME};
 use audio_lock_core::model::{
-    AppState, AudioDevice, DeviceFlow, EnhancementLayer, EnhancementsState,
+    AppState, AudioDevice, AudioProfile, DeviceFlow, EnhancementLayer, EnhancementsState,
     LISTEN_TARGET_COMMS_OUTPUT, LISTEN_TARGET_DEFAULT_OUTPUT, ListenConfig, RightClickAction,
     RoleAssignments, ThemeMode,
 };
 use audio_lock_core::store::{load_state_from, save_state_to};
 use audio_lock_core::update::{
-    CURRENT_VERSION, IDLE_RESTART_MS, UpdateManifest, is_newer_version, parse_semver,
-    staging_root_dir,
+    CURRENT_VERSION, IDLE_RESTART_MS, UpdateManifest, is_newer_version, is_valid_version_dir_name,
+    parse_semver, staging_root_dir,
 };
 
 #[test]
@@ -161,9 +161,14 @@ fn json_round_trip_persistence_and_ipc_messages() {
     let dir = std::env::temp_dir().join(format!("audio-lock-core-test-{unique}"));
     let path = dir.join("state.json");
 
-    // Missing file falls back to mock state.
+    // Missing file falls back to empty default AppState.
     let fallback = load_state_from(&path);
-    assert_eq!(fallback, default_mock_state());
+    assert_eq!(fallback, AppState::default());
+    assert!(fallback.lock_enabled);
+    assert!(fallback.auto_update);
+    assert_eq!(fallback.theme, ThemeMode::Dark);
+    assert!(fallback.devices.is_empty());
+    assert!(fallback.profiles.is_empty());
 
     // Save, overwrite, and reload.
     let mut state = default_mock_state();
@@ -181,14 +186,16 @@ fn json_round_trip_persistence_and_ipc_messages() {
         42
     );
 
-    // Invalid JSON falls back cleanly.
+    // Invalid JSON falls back cleanly to empty default AppState.
     fs::write(&path, b"{not valid json").unwrap();
-    assert_eq!(load_state_from(&path), default_mock_state());
+    assert_eq!(load_state_from(&path), AppState::default());
 
-    let req = IpcRequest::SyncState(state.clone());
-    let req_json = serde_json::to_string(&req).unwrap();
-    let req_back: IpcRequest = serde_json::from_str(&req_json).unwrap();
-    assert_eq!(req_back, req);
+    assert_eq!(QUIT_EVENT_NAME, "Local\\DefaultAudioLockQuitEvent");
+    for req in [IpcRequest::GetState, IpcRequest::Ping] {
+        let req_json = serde_json::to_string(&req).unwrap();
+        let req_back: IpcRequest = serde_json::from_str(&req_json).unwrap();
+        assert_eq!(req_back, req);
+    }
 
     let resp = IpcResponse::State(state);
     let resp_json = serde_json::to_string(&resp).unwrap();
@@ -680,10 +687,27 @@ fn apply_action_updates_all_state_dimensions_consistently() {
     assert_eq!(scarlett.volume, 100);
     assert!(scarlett.muted);
 
+    state.apply_action(&AppAction::SetMute {
+        device_id: "out-scarlett".into(),
+        muted: false,
+    });
+    assert!(!state.device("out-scarlett").unwrap().muted);
+    state.apply_action(&AppAction::SetMute {
+        device_id: "out-scarlett".into(),
+        muted: false,
+    });
+    assert!(!state.device("out-scarlett").unwrap().muted);
+
     state.apply_action(&AppAction::ToggleDevicePin {
         device_id: "out-scarlett".into(),
     });
     assert!(state.device("out-scarlett").unwrap().pinned);
+
+    state.apply_action(&AppAction::SetDevicePinned {
+        device_id: "out-scarlett".into(),
+        pinned: false,
+    });
+    assert!(!state.device("out-scarlett").unwrap().pinned);
 
     state.apply_action(&AppAction::SetEnhancementsDisabled {
         device_id: "out-hd660s2".into(),
@@ -806,12 +830,20 @@ fn ipc_apply_action_round_trips_json() {
         IpcRequest::ApplyAction(AppAction::ToggleMute {
             device_id: "in-mv7".into(),
         }),
+        IpcRequest::ApplyAction(AppAction::SetMute {
+            device_id: "in-mv7".into(),
+            muted: true,
+        }),
         IpcRequest::ApplyAction(AppAction::SetEnhancementsDisabled {
             device_id: "out-hd660s2".into(),
             disabled: true,
         }),
         IpcRequest::ApplyAction(AppAction::ToggleDevicePin {
             device_id: "out-scarlett".into(),
+        }),
+        IpcRequest::ApplyAction(AppAction::SetDevicePinned {
+            device_id: "out-scarlett".into(),
+            pinned: true,
         }),
         IpcRequest::ApplyAction(AppAction::SetListenEnabled {
             device_id: "in-mv7".into(),
@@ -841,10 +873,13 @@ fn ipc_apply_action_round_trips_json() {
 
 #[test]
 fn semver_parsing_and_comparison_handle_prefixes_suffixes_and_invalid() {
-    assert_eq!(parse_semver("0.1.0"), Some((0, 1, 0)));
-    assert_eq!(parse_semver("v0.1.1"), Some((0, 1, 1)));
-    assert_eq!(parse_semver("V1.2.3-rc.1+build.42"), Some((1, 2, 3)));
-    assert_eq!(parse_semver(" 2.10.4+sha "), Some((2, 10, 4)));
+    assert_eq!(parse_semver("0.1.0"), Some((0, 1, 0, None)));
+    assert_eq!(parse_semver("v0.1.1"), Some((0, 1, 1, None)));
+    assert_eq!(
+        parse_semver("V1.2.3-rc.1+build.42"),
+        Some((1, 2, 3, Some("rc.1".into())))
+    );
+    assert_eq!(parse_semver(" 2.10.4+sha "), Some((2, 10, 4, None)));
 
     assert_eq!(parse_semver(""), None);
     assert_eq!(parse_semver("0.1"), None);
@@ -852,16 +887,39 @@ fn semver_parsing_and_comparison_handle_prefixes_suffixes_and_invalid() {
     assert_eq!(parse_semver("vv0.1.0"), None);
     assert_eq!(parse_semver("0.1.x"), None);
     assert_eq!(parse_semver("-0.1.0"), None);
+    assert_eq!(parse_semver("0.1.0-"), None);
+    assert_eq!(parse_semver("0.1.0-rc..1"), None);
 
     assert!(is_newer_version("0.1.0", "v0.1.1"));
     assert!(is_newer_version("0.1.0", "0.2.0"));
     assert!(is_newer_version("0.1.9", "0.1.10"));
+    assert!(is_newer_version("0.1.9", "0.2.0-beta.1"));
+    assert!(is_newer_version("0.2.0-beta.1", "0.2.0-rc.1"));
+    assert!(is_newer_version("0.2.0-rc.1", "0.2.0"));
+    assert!(is_newer_version("0.2.0-alpha.1", "0.2.0-alpha.2"));
+    assert!(is_newer_version("0.2.0-beta.2", "0.2.0-beta.11"));
+    assert!(is_newer_version("0.2.0-alpha.1", "0.2.0-alpha.beta"));
 
     assert!(!is_newer_version("0.1.0", "0.1.0"));
     assert!(!is_newer_version("0.1.0", "v0.1.0"));
     assert!(!is_newer_version("0.2.0", "0.1.9"));
+    assert!(!is_newer_version("0.2.0", "0.2.0-rc.1"));
+    assert!(!is_newer_version("0.2.0-rc.1", "0.2.0-beta.1"));
+    assert!(!is_newer_version("0.2.0-alpha.2", "0.2.0-alpha.1"));
     assert!(!is_newer_version("0.1.0", "invalid"));
     assert!(!is_newer_version("invalid", "0.2.0"));
+
+    assert!(is_valid_version_dir_name("0.2.0"));
+    assert!(is_valid_version_dir_name("v0.2.0-rc.1"));
+    assert!(is_valid_version_dir_name("0.2.0-alpha-1"));
+    assert!(!is_valid_version_dir_name("0.2.0-alpha_1"));
+    assert!(!is_valid_version_dir_name(""));
+    assert!(!is_valid_version_dir_name(".."));
+    assert!(!is_valid_version_dir_name("../0.2.0"));
+    assert!(!is_valid_version_dir_name("0.2.0/foo"));
+    assert!(!is_valid_version_dir_name("0.2.0\\foo"));
+    assert!(!is_valid_version_dir_name("0.2.0+build1"));
+    assert!(!is_valid_version_dir_name("not-a-version"));
 }
 
 #[test]
@@ -1083,4 +1141,278 @@ fn legacy_state_json_without_disabled_fields_deserializes_with_false() {
     assert!(!loaded.auto_disable_unused_devices);
     assert!(loaded.devices.iter().all(|d| !d.disabled));
     assert_eq!(loaded, state);
+}
+
+#[test]
+fn reconcile_live_devices_preserves_locked_real_id_across_unplug_and_replug() {
+    let out_usb = "{0.0.0.00000000}.{aaaa1111-1111-1111-1111-111111111111}";
+    let out_hdmi = "{0.0.0.00000000}.{bbbb2222-2222-2222-2222-222222222222}";
+    let in_usb = "{0.0.1.00000000}.{cccc3333-3333-3333-3333-333333333333}";
+    let in_aux = "{0.0.1.00000000}.{dddd4444-4444-4444-4444-444444444444}";
+
+    let mut state = AppState::default();
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_usb, "USB DAC", DeviceFlow::Output),
+            live_device(out_hdmi, "Monitor HDMI", DeviceFlow::Output),
+            live_device(in_usb, "USB Mic", DeviceFlow::Input),
+            live_device(in_aux, "Line In", DeviceFlow::Input),
+        ],
+        RoleAssignments {
+            default_output_id: out_usb.into(),
+            comms_output_id: out_usb.into(),
+            default_input_id: in_usb.into(),
+            comms_input_id: in_usb.into(),
+        },
+    );
+
+    // Temporarily unplug USB DAC and USB Mic while lock_enabled is true.
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_hdmi, "Monitor HDMI", DeviceFlow::Output),
+            live_device(in_aux, "Line In", DeviceFlow::Input),
+        ],
+        RoleAssignments {
+            default_output_id: out_hdmi.into(),
+            comms_output_id: out_hdmi.into(),
+            default_input_id: in_aux.into(),
+            comms_input_id: in_aux.into(),
+        },
+    );
+
+    assert_eq!(state.roles.default_output_id, out_usb);
+    assert_eq!(state.roles.comms_output_id, out_usb);
+    assert_eq!(state.roles.default_input_id, in_usb);
+    assert_eq!(state.roles.comms_input_id, in_usb);
+
+    // Replugging restores the devices under the still-locked role IDs.
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_usb, "USB DAC", DeviceFlow::Output),
+            live_device(out_hdmi, "Monitor HDMI", DeviceFlow::Output),
+            live_device(in_usb, "USB Mic", DeviceFlow::Input),
+            live_device(in_aux, "Line In", DeviceFlow::Input),
+        ],
+        RoleAssignments {
+            default_output_id: out_hdmi.into(),
+            comms_output_id: out_hdmi.into(),
+            default_input_id: in_aux.into(),
+            comms_input_id: in_aux.into(),
+        },
+    );
+
+    assert_eq!(state.roles.default_output_id, out_usb);
+    assert_eq!(state.roles.comms_output_id, out_usb);
+    assert_eq!(state.roles.default_input_id, in_usb);
+    assert_eq!(state.roles.comms_input_id, in_usb);
+}
+
+#[test]
+fn set_separate_comms_role_false_and_apply_profile_unify_comms_roles() {
+    let mut state = default_mock_state();
+    state.apply_action(&AppAction::SetSeparateCommsRole(true));
+    state.apply_action(&AppAction::SetDefault {
+        flow: DeviceFlow::Output,
+        device_id: "out-hd660s2".into(),
+    });
+    state.apply_action(&AppAction::SetComms {
+        flow: DeviceFlow::Output,
+        device_id: "out-arctis-chat".into(),
+    });
+    state.apply_action(&AppAction::SetDefault {
+        flow: DeviceFlow::Input,
+        device_id: "in-mv7".into(),
+    });
+    state.apply_action(&AppAction::SetComms {
+        flow: DeviceFlow::Input,
+        device_id: "in-arctis-mic".into(),
+    });
+    state.apply_action(&AppAction::SetAutoDisableUnusedDevices(true));
+    assert!(!state.device("out-arctis-chat").unwrap().disabled);
+    assert!(!state.device("in-arctis-mic").unwrap().disabled);
+
+    // Turning separate_comms_role off unifies comms roles and disables no-longer-used comms devices.
+    state.apply_action(&AppAction::SetSeparateCommsRole(false));
+    assert!(!state.separate_comms_role);
+    assert_eq!(state.roles.comms_output_id, "out-hd660s2");
+    assert_eq!(state.roles.comms_input_id, "in-mv7");
+    assert!(state.device("out-arctis-chat").unwrap().disabled);
+    assert!(state.device("in-arctis-mic").unwrap().disabled);
+
+    // Applying a profile with split roles while separate_comms_role is false unifies comms_*_id.
+    state.profiles.push(AudioProfile {
+        id: "split".into(),
+        name: "Split".into(),
+        roles: RoleAssignments {
+            default_output_id: "out-scarlett".into(),
+            comms_output_id: "out-arctis-chat".into(),
+            default_input_id: "in-scarlett-line".into(),
+            comms_input_id: "in-arctis-mic".into(),
+        },
+        device_settings: vec![],
+    });
+    assert!(state.apply_profile("split"));
+    assert_eq!(state.roles.default_output_id, "out-scarlett");
+    assert_eq!(state.roles.comms_output_id, "out-scarlett");
+    assert_eq!(state.roles.default_input_id, "in-scarlett-line");
+    assert_eq!(state.roles.comms_input_id, "in-scarlett-line");
+    assert!(state.device("out-arctis-chat").unwrap().disabled);
+    assert!(state.device("in-arctis-mic").unwrap().disabled);
+}
+
+#[test]
+fn set_device_disabled_refuses_last_enabled_and_reassigns_active_roles() {
+    let mut state = AppState {
+        devices: vec![
+            live_device("out-1", "Out 1", DeviceFlow::Output),
+            live_device("out-2", "Out 2", DeviceFlow::Output),
+            live_device("in-1", "In 1", DeviceFlow::Input),
+        ],
+        roles: RoleAssignments {
+            default_output_id: "out-1".into(),
+            comms_output_id: "out-1".into(),
+            default_input_id: "in-1".into(),
+            comms_input_id: "in-1".into(),
+        },
+        ..AppState::default()
+    };
+
+    // Disabling active default/comms output reassigns both roles to the remaining enabled output.
+    assert!(state.set_device_disabled("out-1", true));
+    assert!(state.device("out-1").unwrap().disabled);
+    assert_eq!(state.roles.default_output_id, "out-2");
+    assert_eq!(state.roles.comms_output_id, "out-2");
+
+    // Refuses to disable the last enabled output and last enabled input.
+    assert!(!state.set_device_disabled("out-2", true));
+    assert!(!state.device("out-2").unwrap().disabled);
+    assert!(!state.set_device_disabled("in-1", true));
+    assert!(!state.device("in-1").unwrap().disabled);
+}
+
+#[test]
+fn save_state_to_atomic_overwrite_round_trip() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("audio-lock-atomic-save-{unique}"));
+    let path = dir.join("state.json");
+
+    let mut state = default_mock_state();
+    save_state_to(&path, &state).unwrap();
+
+    for volume in [15, 55, 88] {
+        state.set_volume("out-hd660s2", volume);
+        save_state_to(&path, &state).unwrap();
+    }
+
+    assert!(!path.with_extension("json.tmp").exists());
+    let loaded = load_state_from(&path);
+    assert_eq!(loaded, state);
+    assert_eq!(loaded.device("out-hd660s2").unwrap().volume, 88);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reconcile_live_devices_preserves_listen_sentinels_accurately() {
+    let out_default = "{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}";
+    let out_comms = "{0.0.0.00000000}.{22222222-2222-2222-2222-222222222222}";
+    let out_other = "{0.0.0.00000000}.{33333333-3333-3333-3333-333333333333}";
+    let in_a = "{0.0.1.00000000}.{44444444-4444-4444-4444-444444444444}";
+    let in_b = "{0.0.1.00000000}.{55555555-5555-5555-5555-555555555555}";
+
+    let mut state = AppState {
+        separate_comms_role: true,
+        roles: RoleAssignments {
+            default_output_id: out_default.into(),
+            comms_output_id: out_comms.into(),
+            default_input_id: in_a.into(),
+            comms_input_id: in_a.into(),
+        },
+        devices: vec![
+            live_device(out_default, "Default Out", DeviceFlow::Output),
+            live_device(out_comms, "Comms Out", DeviceFlow::Output),
+            live_device(out_other, "Other Out", DeviceFlow::Output),
+            AudioDevice {
+                listen: Some(ListenConfig {
+                    enabled: false,
+                    target_device_id: Some(LISTEN_TARGET_DEFAULT_OUTPUT.into()),
+                }),
+                ..live_device(in_a, "Mic A", DeviceFlow::Input)
+            },
+            AudioDevice {
+                listen: Some(ListenConfig {
+                    enabled: false,
+                    target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+                }),
+                ..live_device(in_b, "Mic B", DeviceFlow::Input)
+            },
+        ],
+        ..AppState::default()
+    };
+
+    // When live_listen.enabled == false, both sentinels are preserved even if Windows reports None.
+    let mut live_in_a = live_device(in_a, "Mic A", DeviceFlow::Input);
+    live_in_a.listen = Some(ListenConfig {
+        enabled: false,
+        target_device_id: None,
+    });
+    let mut live_in_b = live_device(in_b, "Mic B", DeviceFlow::Input);
+    live_in_b.listen = Some(ListenConfig {
+        enabled: false,
+        target_device_id: Some(out_other.into()),
+    });
+
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_default, "Default Out", DeviceFlow::Output),
+            live_device(out_comms, "Comms Out", DeviceFlow::Output),
+            live_device(out_other, "Other Out", DeviceFlow::Output),
+            live_in_a,
+            live_in_b,
+        ],
+        state.roles.clone(),
+    );
+
+    assert_eq!(
+        state.device(in_a).unwrap().listen,
+        Some(ListenConfig {
+            enabled: false,
+            target_device_id: Some(LISTEN_TARGET_DEFAULT_OUTPUT.into()),
+        })
+    );
+    assert_eq!(
+        state.device(in_b).unwrap().listen,
+        Some(ListenConfig {
+            enabled: false,
+            target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+        })
+    );
+
+    // When live_listen.enabled == true, LISTEN_TARGET_COMMS_OUTPUT is ONLY substituted if
+    // live target matches comms_output_id, NOT if live target was changed to another device.
+    let mut active_in_b = live_device(in_b, "Mic B", DeviceFlow::Input);
+    active_in_b.listen = Some(ListenConfig {
+        enabled: true,
+        target_device_id: Some(out_other.into()),
+    });
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_default, "Default Out", DeviceFlow::Output),
+            live_device(out_comms, "Comms Out", DeviceFlow::Output),
+            live_device(out_other, "Other Out", DeviceFlow::Output),
+            live_device(in_a, "Mic A", DeviceFlow::Input),
+            active_in_b,
+        ],
+        state.roles.clone(),
+    );
+    assert_eq!(
+        state.device(in_b).unwrap().listen,
+        Some(ListenConfig {
+            enabled: true,
+            target_device_id: Some(out_other.into()),
+        })
+    );
 }

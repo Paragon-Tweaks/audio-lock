@@ -1,9 +1,11 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use crate::fake_data::default_mock_state;
 use crate::model::AppState;
+
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn state_file_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -21,20 +23,15 @@ pub fn save_state(state: &AppState) -> io::Result<()> {
     save_state_to(&state_file_path(), state)
 }
 
-pub fn reset_to_mock_state() -> io::Result<AppState> {
-    let state = default_mock_state();
-    save_state(&state)?;
-    Ok(state)
-}
-
 pub fn load_state_from(path: &Path) -> AppState {
     let Ok(bytes) = fs::read(path) else {
-        return default_mock_state();
+        return AppState::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_else(|_| default_mock_state())
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 pub fn save_state_to(path: &Path, state: &AppState) -> io::Result<()> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -44,8 +41,43 @@ pub fn save_state_to(path: &Path, state: &AppState) -> io::Result<()> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     fs::write(&tmp_path, json)?;
 
-    if path.exists() {
-        fs::remove_file(path)?;
+    replace_file(&tmp_path, path)
+}
+
+#[cfg(windows)]
+fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    unsafe extern "system" {
+        fn MoveFileExW(
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            dw_flags: u32,
+        ) -> i32;
     }
-    fs::rename(&tmp_path, path)
+
+    let src_wide: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: Both pointers are valid null-terminated UTF-16 strings for the call duration.
+    let ok = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        let _ = fs::remove_file(src);
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::rename(src, dst)
 }

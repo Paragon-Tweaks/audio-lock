@@ -42,6 +42,7 @@ use crate::win32::{self, WM_APP_REFRESH_TRAY, WakeHandle};
 
 const APP_AUDIO_CONTEXT: GUID = GUID::from_u128(0x9f4a6b2c_8d1e_47c5_a3b0_7e12c5f941d8);
 const LOCK_GUARD_COOLDOWN: Duration = Duration::from_millis(80);
+const LOCK_FOLLOWUP_BUFFER: Duration = Duration::from_millis(20);
 const VISIBILITY_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const VISIBILITY_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const AUTO_ENFORCE_SUPPRESS_WINDOW: Duration = Duration::from_millis(400);
@@ -56,7 +57,6 @@ enum EngineMsg {
     },
     ApplyActionAsync {
         action: AppAction,
-        already_applied: bool,
     },
     ToggleActiveMicsMute {
         reply: mpsc::SyncSender<AppState>,
@@ -127,30 +127,22 @@ impl AudioEngine {
     }
 
     pub fn apply_action_async(&self, action: AppAction) {
-        let already_applied = !matches!(
-            action,
-            AppAction::SetRunOnStartup(_)
-                | AppAction::ApplyStagedUpdateNow
-                | AppAction::CheckForUpdatesNow
-        );
-        if already_applied {
+        let is_volume = matches!(action, AppAction::SetVolume { .. });
+        if is_volume {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.apply_action(&action);
-            if matches!(action, AppAction::ApplyProfile { .. }) && guard.auto_disable_enhancements {
-                guard.set_auto_disable_enhancements(true);
-            }
         }
         if self
             .tx
             .send(EngineMsg::ApplyActionAsync {
                 action: action.clone(),
-                already_applied,
             })
             .is_err()
-            && !already_applied
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.apply_action(&action);
+            if !is_volume {
+                guard.apply_action(&action);
+            }
             let _ = store::save_state(&guard);
         }
     }
@@ -335,6 +327,7 @@ struct AudioWorker {
     last_enforced: HashMap<(DeviceFlow, i32, String), Instant>,
     suppress_auto_enforce_until: Option<Instant>,
     topology_due: Option<Instant>,
+    enforce_due: Option<Instant>,
     save_due: Option<Instant>,
     trim_due: Option<Instant>,
 }
@@ -388,13 +381,10 @@ fn run_worker(
         if let Some(msg) = msg {
             match msg {
                 EngineMsg::ApplyAction { action, reply } => {
-                    let updated = worker.handle_apply_action(action, false);
+                    let updated = worker.handle_apply_action(action);
                     let _ = reply.send(updated);
                 }
-                EngineMsg::ApplyActionAsync {
-                    mut action,
-                    mut already_applied,
-                } => {
+                EngineMsg::ApplyActionAsync { mut action } => {
                     if let AppAction::SetVolume { device_id, .. } = &action {
                         let target_id = device_id.clone();
                         loop {
@@ -405,13 +395,11 @@ fn run_worker(
                                             device_id: next_id,
                                             volume: next_vol,
                                         },
-                                    already_applied: next_applied,
                                 }) if next_id == target_id => {
                                     action = AppAction::SetVolume {
                                         device_id: next_id,
                                         volume: next_vol,
                                     };
-                                    already_applied = next_applied;
                                 }
                                 Ok(other) => {
                                     pending_msg = Some(other);
@@ -421,7 +409,7 @@ fn run_worker(
                             }
                         }
                     }
-                    let _ = worker.handle_apply_action(action, already_applied);
+                    let _ = worker.handle_apply_action(action);
                 }
                 EngineMsg::ToggleActiveMicsMute { reply } => {
                     let updated = worker.handle_toggle_active_mics_mute();
@@ -478,17 +466,30 @@ impl AudioWorker {
             last_enforced: HashMap::new(),
             suppress_auto_enforce_until: None,
             topology_due: None,
+            enforce_due: None,
             save_due: None,
             trim_due: None,
         })
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        earliest_deadline([self.topology_due, self.save_due, self.trim_due])
+        earliest_deadline([
+            self.topology_due,
+            self.enforce_due,
+            self.save_due,
+            self.trim_due,
+        ])
     }
 
     fn schedule_topology_refresh(&mut self) {
         self.topology_due = Some(Instant::now() + TOPOLOGY_COALESCE_DELAY);
+    }
+
+    fn schedule_enforce(&mut self, when: Instant) {
+        self.enforce_due = Some(match self.enforce_due {
+            Some(existing) => existing.max(when),
+            None => when,
+        });
     }
 
     fn schedule_save(&mut self) {
@@ -511,12 +512,32 @@ impl AudioWorker {
             self.topology_due = None;
             self.handle_topology_changed();
         }
+        if self.enforce_due.is_some_and(|due| Instant::now() >= due) {
+            self.enforce_due = None;
+            self.handle_enforce_due();
+        }
         if self.save_due.is_some_and(|due| Instant::now() >= due) {
             self.flush_save();
         }
         if self.trim_due.is_some_and(|due| Instant::now() >= due) {
             self.trim_due = None;
             win32::trim_working_set();
+        }
+    }
+
+    fn handle_enforce_due(&mut self) {
+        if let Some(until) = self.suppress_auto_enforce_until
+            && Instant::now() < until
+        {
+            self.schedule_enforce(until + LOCK_FOLLOWUP_BUFFER);
+            return;
+        }
+        let snapshot = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        if snapshot.lock_enabled && self.enforce_locked_roles(&snapshot) {
+            self.schedule_trim();
         }
     }
 
@@ -529,8 +550,14 @@ impl AudioWorker {
             self.notification_client = Some(client);
         }
 
+        let initial_state = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        self.ensure_locked_roles_enabled(&initial_state);
+
         let (live_devices, live_roles) = self.enumerate_and_subscribe(&HashSet::new());
-        let startup_enabled = startup::is_enabled();
+        let startup_enabled = startup::sync_if_enabled();
 
         let mut snapshot = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -555,6 +582,12 @@ impl AudioWorker {
             self.disable_all_active_enhancements(&snapshot);
         }
         if snapshot.lock_enabled {
+            if self.ensure_locked_roles_enabled(&snapshot) {
+                snapshot = self.refresh_live_state();
+                if snapshot.auto_disable_enhancements {
+                    self.disable_all_active_enhancements(&snapshot);
+                }
+            }
             self.enforce_locked_roles(&snapshot);
         }
         win32::trim_working_set();
@@ -963,9 +996,16 @@ impl AudioWorker {
     }
 
     fn handle_topology_changed(&mut self) {
+        let was_suppressed = self.is_auto_enforce_suppressed();
+        let prior_state = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        let reenabled_locked = self.ensure_locked_roles_enabled(&prior_state);
+
         let mut snapshot = self.refresh_live_state();
 
-        if snapshot.auto_disable_unused_devices && !self.is_auto_enforce_suppressed() {
+        if snapshot.auto_disable_unused_devices && (!was_suppressed || reenabled_locked) {
             let enforced = self.enforce_unused_devices(&snapshot);
             if enforced.enabled_any || enforced.needs_reconcile {
                 snapshot = self.refresh_live_state_excluding_pending(&enforced.disabled_ids);
@@ -977,6 +1017,12 @@ impl AudioWorker {
             self.disable_all_active_enhancements(&snapshot);
         }
         if snapshot.lock_enabled {
+            if self.ensure_locked_roles_enabled(&snapshot) {
+                snapshot = self.refresh_live_state();
+                if snapshot.auto_disable_enhancements {
+                    self.disable_all_active_enhancements(&snapshot);
+                }
+            }
             self.enforce_locked_roles(&snapshot);
         }
         self.resync_comms_listen_targets(&snapshot);
@@ -1001,20 +1047,23 @@ impl AudioWorker {
         };
 
         if lock_enabled {
-            if should_enforce
-                && !self.is_auto_enforce_suppressed()
-                && self.device_state(&expected) == Some(DEVICE_STATE_ACTIVE)
-            {
-                let key = (flow, role.0, expected.clone());
+            if should_enforce {
                 let now = Instant::now();
-                let in_cooldown = self
-                    .last_enforced
-                    .get(&key)
-                    .is_some_and(|at| now.duration_since(*at) < LOCK_GUARD_COOLDOWN);
-                if !in_cooldown {
-                    self.last_enforced.insert(key, now);
-                    let _ = self.policy.set_default_endpoint(&expected, role);
-                    self.schedule_trim();
+                if let Some(until) = self.suppress_auto_enforce_until
+                    && now < until
+                {
+                    self.schedule_enforce(until + LOCK_FOLLOWUP_BUFFER);
+                } else if self.device_state(&expected) == Some(DEVICE_STATE_ACTIVE) {
+                    let key = (flow, role.0, expected.clone());
+                    if let Some(&at) = self.last_enforced.get(&key)
+                        && now < at + LOCK_GUARD_COOLDOWN
+                    {
+                        self.schedule_enforce(at + LOCK_GUARD_COOLDOWN + LOCK_FOLLOWUP_BUFFER);
+                    } else {
+                        self.last_enforced.insert(key, now);
+                        let _ = self.policy.set_default_endpoint(&expected, role);
+                        self.schedule_trim();
+                    }
                 }
             }
             return;
@@ -1179,8 +1228,10 @@ impl AudioWorker {
         }
     }
 
-    fn handle_apply_action(&mut self, action: AppAction, already_applied: bool) -> AppState {
+    fn handle_apply_action(&mut self, action: AppAction) -> AppState {
         let defer_save = matches!(action, AppAction::SetVolume { .. });
+        let mut previous_roles: Option<RoleAssignments> = None;
+        let mut disable_accepted = true;
         let mut snapshot = {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &action {
@@ -1191,7 +1242,18 @@ impl AudioWorker {
                         guard.run_on_startup = startup::is_enabled();
                     }
                 }
-                _ if !already_applied => {
+                AppAction::SetDeviceDisabled {
+                    device_id,
+                    disabled,
+                } => {
+                    if guard.auto_disable_unused_devices {
+                        disable_accepted = false;
+                    } else {
+                        previous_roles = Some(guard.roles.clone());
+                        disable_accepted = guard.set_device_disabled(device_id, *disabled);
+                    }
+                }
+                _ => {
                     guard.apply_action(&action);
                     if matches!(action, AppAction::ApplyProfile { .. })
                         && guard.auto_disable_enhancements
@@ -1199,9 +1261,8 @@ impl AudioWorker {
                         guard.set_auto_disable_enhancements(true);
                     }
                 }
-                _ => {}
             }
-            if !defer_save {
+            if !defer_save && disable_accepted {
                 self.save_due = None;
                 let _ = store::save_state(&guard);
             }
@@ -1215,8 +1276,36 @@ impl AudioWorker {
             AppAction::SetLockEnabled(true) => {
                 self.enforce_locked_roles(&snapshot);
             }
-            AppAction::SetSeparateCommsRole(false) if snapshot.lock_enabled => {
-                self.enforce_locked_roles(&snapshot);
+            AppAction::SetSeparateCommsRole(false) => {
+                for (flow, target_id) in [
+                    (DeviceFlow::Output, snapshot.roles.comms_output_id.as_str()),
+                    (DeviceFlow::Input, snapshot.roles.comms_input_id.as_str()),
+                ] {
+                    if !target_id.is_empty()
+                        && snapshot.has_device_with_flow(flow, target_id)
+                        && self.device_state(target_id) == Some(DEVICE_STATE_ACTIVE)
+                    {
+                        if snapshot.lock_enabled {
+                            self.last_enforced.insert(
+                                (flow, eCommunications.0, target_id.to_string()),
+                                Instant::now(),
+                            );
+                        }
+                        self.set_default_endpoint_if_needed(flow, eCommunications, target_id);
+                    }
+                }
+                if snapshot.lock_enabled {
+                    self.enforce_locked_roles(&snapshot);
+                }
+                self.resync_comms_listen_targets(&snapshot);
+                if snapshot.auto_disable_unused_devices {
+                    let enforced = self.enforce_unused_devices(&snapshot);
+                    if enforced.enabled_any || enforced.needs_reconcile {
+                        snapshot = self.refresh_live_state_excluding_pending(&enforced.disabled_ids);
+                    } else if !enforced.disabled_ids.is_empty() {
+                        snapshot = self.mark_devices_disabled(&enforced.disabled_ids);
+                    }
+                }
             }
             AppAction::SetDefault { flow, device_id } => {
                 if snapshot.has_device_with_flow(flow, &device_id) {
@@ -1286,6 +1375,11 @@ impl AudioWorker {
                     self.set_endpoint_mute(&device_id, dev.muted);
                 }
             }
+            AppAction::SetMute { device_id, muted } => {
+                if snapshot.device(&device_id).is_some() {
+                    self.set_endpoint_mute(&device_id, muted);
+                }
+            }
             AppAction::SetEnhancementsDisabled {
                 device_id,
                 disabled,
@@ -1308,7 +1402,7 @@ impl AudioWorker {
                     }
                 }
             }
-            AppAction::ToggleDevicePin { .. } => {
+            AppAction::ToggleDevicePin { .. } | AppAction::SetDevicePinned { .. } => {
                 if snapshot.auto_disable_unused_devices {
                     let enforced = self.enforce_unused_devices(&snapshot);
                     if enforced.enabled_any || enforced.needs_reconcile {
@@ -1350,18 +1444,34 @@ impl AudioWorker {
                 device_id,
                 disabled,
             } => {
-                if !snapshot.auto_disable_unused_devices
+                if disable_accepted
+                    && !snapshot.auto_disable_unused_devices
                     && let Some(dev) = snapshot.device(&device_id)
                 {
                     let flow = dev.flow;
-                    self.suppress_auto_enforce();
                     if disabled {
-                        if self.device_state(&device_id) != Some(DEVICE_STATE_DISABLED)
-                            && self.policy.set_endpoint_visibility(&device_id, false).is_err()
-                        {
-                            self.schedule_topology_refresh();
+                        let has_other_active = snapshot.devices.iter().any(|other| {
+                            other.flow == flow
+                                && other.id != device_id
+                                && self.device_state(&other.id) == Some(DEVICE_STATE_ACTIVE)
+                        });
+                        if !has_other_active {
+                            snapshot = self.refresh_live_state();
+                        } else {
+                            self.suppress_auto_enforce();
+                            if let Some(prev) = previous_roles.as_ref()
+                                && *prev != snapshot.roles
+                            {
+                                self.apply_reassigned_roles(prev, &snapshot);
+                            }
+                            if self.device_state(&device_id) != Some(DEVICE_STATE_DISABLED)
+                                && self.policy.set_endpoint_visibility(&device_id, false).is_err()
+                            {
+                                snapshot = self.refresh_live_state();
+                            }
                         }
                     } else {
+                        self.suppress_auto_enforce();
                         if self.ensure_device_enabled(&device_id) {
                             if snapshot.auto_disable_enhancements {
                                 self.disable_device_enhancements(&device_id, flow, false);
@@ -1454,7 +1564,101 @@ impl AudioWorker {
         snapshot
     }
 
-    fn enforce_locked_roles(&mut self, state: &AppState) {
+    fn ensure_locked_roles_enabled(&mut self, state: &AppState) -> bool {
+        if !state.lock_enabled {
+            return false;
+        }
+        let mut enabled_any = false;
+        for id in locked_role_ids(state) {
+            if self.device_state(id) == Some(DEVICE_STATE_DISABLED) {
+                self.suppress_auto_enforce();
+                if self.ensure_device_enabled(id) {
+                    enabled_any = true;
+                }
+            }
+        }
+        enabled_any
+    }
+
+    fn apply_reassigned_roles(&mut self, previous: &RoleAssignments, current: &AppState) {
+        let mut comms_output_changed = false;
+        let comms_out = if current.separate_comms_role {
+            current.roles.comms_output_id.as_str()
+        } else {
+            current.roles.default_output_id.as_str()
+        };
+        let comms_in = if current.separate_comms_role {
+            current.roles.comms_input_id.as_str()
+        } else {
+            current.roles.default_input_id.as_str()
+        };
+
+        let role_updates = [
+            (
+                previous.default_output_id != current.roles.default_output_id,
+                DeviceFlow::Output,
+                eConsole,
+                current.roles.default_output_id.as_str(),
+            ),
+            (
+                previous.default_output_id != current.roles.default_output_id,
+                DeviceFlow::Output,
+                eMultimedia,
+                current.roles.default_output_id.as_str(),
+            ),
+            (
+                previous.comms_output_id != current.roles.comms_output_id
+                    || (!current.separate_comms_role
+                        && previous.default_output_id != current.roles.default_output_id),
+                DeviceFlow::Output,
+                eCommunications,
+                comms_out,
+            ),
+            (
+                previous.default_input_id != current.roles.default_input_id,
+                DeviceFlow::Input,
+                eConsole,
+                current.roles.default_input_id.as_str(),
+            ),
+            (
+                previous.default_input_id != current.roles.default_input_id,
+                DeviceFlow::Input,
+                eMultimedia,
+                current.roles.default_input_id.as_str(),
+            ),
+            (
+                previous.comms_input_id != current.roles.comms_input_id
+                    || (!current.separate_comms_role
+                        && previous.default_input_id != current.roles.default_input_id),
+                DeviceFlow::Input,
+                eCommunications,
+                comms_in,
+            ),
+        ];
+
+        for (changed, flow, role, target_id) in role_updates {
+            if !changed
+                || target_id.is_empty()
+                || self.device_state(target_id) != Some(DEVICE_STATE_ACTIVE)
+            {
+                continue;
+            }
+            if current.lock_enabled {
+                self.last_enforced
+                    .insert((flow, role.0, target_id.to_string()), Instant::now());
+            }
+            self.set_default_endpoint_if_needed(flow, role, target_id);
+            if flow == DeviceFlow::Output && role == eCommunications {
+                comms_output_changed = true;
+            }
+        }
+
+        if comms_output_changed {
+            self.resync_comms_listen_targets(current);
+        }
+    }
+
+    fn enforce_locked_roles(&mut self, state: &AppState) -> bool {
         let comms_out = if state.separate_comms_role {
             state.roles.comms_output_id.as_str()
         } else {
@@ -1495,6 +1699,7 @@ impl AudioWorker {
             (DeviceFlow::Input, eCapture, eCommunications, comms_in),
         ];
 
+        let mut enforced_any = false;
         for (flow, win_flow, role, target_id) in targets {
             if target_id.is_empty()
                 || !state.has_device_with_flow(flow, target_id)
@@ -1507,8 +1712,10 @@ impl AudioWorker {
                 self.last_enforced
                     .insert((flow, role.0, target_id.to_string()), Instant::now());
                 let _ = self.policy.set_default_endpoint(target_id, role);
+                enforced_any = true;
             }
         }
+        enforced_any
     }
 
     fn apply_profile_to_windows(
@@ -1573,6 +1780,8 @@ impl AudioWorker {
                 self.apply_listen_config(&device.id, listen, state);
             }
         }
+
+        self.resync_comms_listen_targets(state);
 
         if state.auto_disable_unused_devices {
             self.enforce_unused_devices(state).disabled_ids
@@ -1769,6 +1978,31 @@ fn desired_effective_listen<'a>(
         None => None,
     };
     (active, normalized_target)
+}
+
+fn locked_role_ids(state: &AppState) -> Vec<&str> {
+    let mut ids = Vec::with_capacity(4);
+    let candidates = if state.separate_comms_role {
+        [
+            state.roles.default_output_id.as_str(),
+            state.roles.comms_output_id.as_str(),
+            state.roles.default_input_id.as_str(),
+            state.roles.comms_input_id.as_str(),
+        ]
+    } else {
+        [
+            state.roles.default_output_id.as_str(),
+            "",
+            state.roles.default_input_id.as_str(),
+            "",
+        ]
+    };
+    for id in candidates {
+        if !id.is_empty() && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 fn expected_role_device(state: &AppState, flow: DeviceFlow, role: ERole) -> &str {
@@ -2112,12 +2346,41 @@ mod tests {
     fn earliest_deadline_picks_minimum_or_none() {
         let now = Instant::now();
         let t1 = now + Duration::from_millis(50);
-        let t2 = now + Duration::from_millis(250);
-        let t3 = now + Duration::from_secs(3);
+        let t2 = now + Duration::from_millis(100);
+        let t3 = now + Duration::from_millis(250);
+        let t4 = now + Duration::from_secs(3);
 
-        assert_eq!(earliest_deadline([None, None, None]), None);
-        assert_eq!(earliest_deadline([None, Some(t2), Some(t3)]), Some(t2));
-        assert_eq!(earliest_deadline([Some(t1), Some(t2), Some(t3)]), Some(t1));
-        assert_eq!(earliest_deadline([None, None, Some(t3)]), Some(t3));
+        assert_eq!(earliest_deadline([None, None, None, None]), None);
+        assert_eq!(
+            earliest_deadline([None, Some(t2), Some(t3), Some(t4)]),
+            Some(t2)
+        );
+        assert_eq!(
+            earliest_deadline([Some(t1), Some(t2), Some(t3), Some(t4)]),
+            Some(t1)
+        );
+        assert_eq!(earliest_deadline([None, None, None, Some(t4)]), Some(t4));
+    }
+
+    #[test]
+    fn locked_role_ids_deduplicates_and_respects_separate_comms_mode() {
+        let mut state = default_mock_state();
+        state.separate_comms_role = false;
+        state.roles.default_output_id = "out-hd660s2".into();
+        state.roles.comms_output_id = "out-arctis-chat".into();
+        state.roles.default_input_id = "in-mv7".into();
+        state.roles.comms_input_id = "in-arctis-mic".into();
+
+        assert_eq!(locked_role_ids(&state), vec!["out-hd660s2", "in-mv7"]);
+
+        state.separate_comms_role = true;
+        assert_eq!(
+            locked_role_ids(&state),
+            vec!["out-hd660s2", "out-arctis-chat", "in-mv7", "in-arctis-mic"]
+        );
+
+        state.roles.comms_output_id = "out-hd660s2".into();
+        state.roles.comms_input_id = String::new();
+        assert_eq!(locked_role_ids(&state), vec!["out-hd660s2", "in-mv7"]);
     }
 }

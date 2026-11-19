@@ -9,7 +9,15 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
+repository = "https://github.com/Paragon-Tweaks/audio-lock"
+description = "Zero-overhead Windows audio device lock, mic-mute tray utility, and profile manager"
+rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

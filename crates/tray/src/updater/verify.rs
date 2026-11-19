@@ -108,9 +108,13 @@ pub fn sha256_file_hex(path: &Path) -> Result<String, String> {
     Ok(hex)
 }
 
+pub fn is_valid_sha256_hex(hex: &str) -> bool {
+    hex.len() == SHA256_LEN * 2 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
     let expected = expected_hex.trim();
-    if expected.len() != SHA256_LEN * 2 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_valid_sha256_hex(expected) {
         return Err("Invalid expected SHA-256 hex string".to_string());
     }
 

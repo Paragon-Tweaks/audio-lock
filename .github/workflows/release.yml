@@ -32,21 +32,56 @@ jobs:
       - name: Resolve release version
         id: version
         shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $ver = "${{ github.ref_name }}".TrimStart("v", "V")
-          } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.version }}")) {
-            $ver = "${{ inputs.version }}".Trim().TrimStart("v", "V")
+          if ($env:REF_TYPE -eq "tag") {
+            $ver = $env:REF_NAME.TrimStart("v", "V")
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+            $ver = $env:INPUT_VERSION.Trim().TrimStart("v", "V")
           } else {
             $cargo = Get-Content -Path "Cargo.toml" -Raw
-            if ($cargo -match '(?ms)^\[workspace\.package\].*?^\s*version\s*=\s*"([^"]+)"') {
-              $ver = $Matches[1]
+            if ($cargo -match '(?ms)^\[workspace\.package\]\s*\r?\n(.*?)(?=^\[|\z)' -and $Matches[1] -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
+              $ver = $Matches[1].Trim()
             } else {
-              throw "Could not read version from Cargo.toml"
+              throw "Could not read [workspace.package].version from Cargo.toml"
             }
           }
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Verify release version matches Cargo.toml
+        shell: pwsh
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $tagVersion = $env:TAG_VERSION.Trim()
+          $semverRegex = '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$'
+          if ($tagVersion -notmatch $semverRegex) {
+            throw "Release version '$tagVersion' does not match strict semver pattern '$semverRegex'."
+          }
+
+          $cargo = Get-Content -Path "Cargo.toml" -Raw
+          if ($cargo -match '(?ms)^\[workspace\.package\]\s*\r?\n(.*?)(?=^\[|\z)' -and $Matches[1] -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
+            $cargoVersion = $Matches[1].Trim()
+          } else {
+            throw "Could not parse [workspace.package].version from Cargo.toml."
+          }
+
+          if ($cargoVersion -notmatch $semverRegex) {
+            throw "Cargo.toml [workspace.package].version '$cargoVersion' does not match strict semver pattern '$semverRegex'."
+          }
+
+          if ($tagVersion -ne $cargoVersion) {
+            throw "Release version '$tagVersion' does not match Cargo.toml [workspace.package].version '$cargoVersion'."
+          }
+
+          Write-Host "Verified release version $tagVersion matches Cargo.toml."
+
+      - name: Run workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run workspace tests
         run: cargo test --workspace
@@ -70,8 +105,11 @@ jobs:
 
       - name: Package update zip, installer, and manifest
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          GITHUB_REPO: ${{ github.repository }}
         run: |
-          $version = "${{ steps.version.outputs.version }}"
+          $version = $env:RELEASE_VERSION
           New-Item -ItemType Directory -Path "dist" -Force | Out-Null
 
           $trayExe = "target\release\default-audio-lock.exe"
@@ -90,7 +128,7 @@ jobs:
 
           $sha256 = (Get-FileHash -Path $updateZip -Algorithm SHA256).Hash.ToLowerInvariant()
           $publishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/v$version/default-audio-lock-win64-update.zip"
+          $assetUrl = "https://github.com/$($env:GITHUB_REPO)/releases/download/v$version/default-audio-lock-win64-update.zip"
 
           $manifest = [ordered]@{
             version      = $version

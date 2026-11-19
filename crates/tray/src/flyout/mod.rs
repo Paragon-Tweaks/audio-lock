@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use audio_lock_core::ipc::AppAction;
 use audio_lock_core::model::{AppState, DeviceFlow, RightClickAction, ThemeMode};
 use windows::Win32::Foundation::{
-    COLORREF, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    COLORREF, GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, GdiFlush, GetMonitorInfoW, HDC, HGDIOBJ,
-    HMONITOR, IntersectClipRect, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, GdiFlush, GetMonitorInfoW, HBITMAP, HDC,
+    HGDIOBJ, HMONITOR, IntersectClipRect, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
     TRANSPARENT,
 };
@@ -29,7 +29,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -39,9 +41,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrW, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEWE,
-    KillTimer, LoadCursorW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SetCursor,
+    KillTimer, LoadCursorW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WA_INACTIVE,
-    WHEEL_DELTA, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_ERASEBKGND, WM_KEYDOWN,
+    WHEEL_DELTA, WM_ACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
     WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -213,6 +215,7 @@ impl FlyoutController {
             height: final_h,
             fonts,
             measure_dc,
+            backbuffer: DibBackbuffer::empty(),
             active_tab: DeviceFlow::Output,
             pinned: false,
             search_query: String::new(),
@@ -304,6 +307,23 @@ impl FlyoutController {
         }
     }
 
+    pub fn flash_status(&self, msg: &str) {
+        let Some(hwnd) = self.shared.active_hwnd.get() else {
+            return;
+        };
+        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowData;
+        if ptr.is_null() {
+            return;
+        }
+        {
+            let data = unsafe { &mut *ptr };
+            data.flash_status(hwnd, msg);
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+
     pub fn take_events(&self) -> Vec<FlyoutEvent> {
         std::mem::take(&mut *self.shared.pending_events.borrow_mut())
     }
@@ -315,6 +335,133 @@ impl Drop for FlyoutController {
     }
 }
 
+enum PostMsgAction {
+    None,
+    Close,
+    Capture,
+    ReleaseCapture,
+    DwmBorder(Color),
+    CopyClipboard(String),
+    PasteClipboard,
+}
+
+struct DibBackbuffer {
+    mem_dc: HDC,
+    dib: HBITMAP,
+    old_obj: HGDIOBJ,
+    pixels: *mut u32,
+    buf_w: i32,
+    buf_h: i32,
+}
+
+impl DibBackbuffer {
+    fn empty() -> Self {
+        Self {
+            mem_dc: HDC::default(),
+            dib: HBITMAP::default(),
+            old_obj: HGDIOBJ::default(),
+            pixels: std::ptr::null_mut(),
+            buf_w: 0,
+            buf_h: 0,
+        }
+    }
+
+    fn ensure(&mut self, hdc: HDC, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        if !self.mem_dc.is_invalid()
+            && !self.dib.0.is_null()
+            && !self.pixels.is_null()
+            && self.buf_w == width
+            && self.buf_h == height
+        {
+            return true;
+        }
+
+        self.release();
+
+        let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
+        if mem_dc.is_invalid() {
+            return false;
+        }
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let Ok(dib) =
+            (unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) })
+        else {
+            unsafe {
+                let _ = DeleteDC(mem_dc);
+            }
+            return false;
+        };
+
+        if bits.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(dib.0));
+                let _ = DeleteDC(mem_dc);
+            }
+            return false;
+        }
+
+        let old_obj = unsafe { SelectObject(mem_dc, HGDIOBJ(dib.0)) };
+        unsafe {
+            SetBkMode(mem_dc, TRANSPARENT);
+        }
+
+        self.mem_dc = mem_dc;
+        self.dib = dib;
+        self.old_obj = old_obj;
+        self.pixels = bits.cast::<u32>();
+        self.buf_w = width;
+        self.buf_h = height;
+        true
+    }
+
+    fn release(&mut self) {
+        if !self.mem_dc.is_invalid() {
+            unsafe {
+                if !self.old_obj.0.is_null() {
+                    SelectObject(self.mem_dc, self.old_obj);
+                }
+                if !self.dib.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(self.dib.0));
+                }
+                let _ = DeleteDC(self.mem_dc);
+            }
+        } else if !self.dib.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            }
+        }
+        self.mem_dc = HDC::default();
+        self.dib = HBITMAP::default();
+        self.old_obj = HGDIOBJ::default();
+        self.pixels = std::ptr::null_mut();
+        self.buf_w = 0;
+        self.buf_h = 0;
+    }
+}
+
+impl Drop for DibBackbuffer {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct WindowData {
     shared: Rc<FlyoutShared>,
     scale: f32,
@@ -322,6 +469,7 @@ struct WindowData {
     height: i32,
     fonts: FontCache,
     measure_dc: HDC,
+    backbuffer: DibBackbuffer,
     active_tab: DeviceFlow,
     pinned: bool,
     search_query: String,
@@ -417,20 +565,23 @@ impl WindowData {
         }
     }
 
-    fn dispatch(&mut self, hwnd: HWND, action: AppAction, status: Option<String>) {
+    fn dispatch(&mut self, hwnd: HWND, action: AppAction, status: Option<String>) -> PostMsgAction {
         self.shared.audio.apply_action_async(action);
         if let Some(msg) = status {
             self.flash_status(hwnd, msg);
         }
         let snapshot = self.snapshot();
-        if self.last_theme != snapshot.theme {
+        let post = if self.last_theme != snapshot.theme {
             self.last_theme = snapshot.theme;
-            let _ = apply_dwm_chrome(hwnd, Theme::from_mode(snapshot.theme).border_strong);
-        }
+            PostMsgAction::DwmBorder(Theme::from_mode(snapshot.theme).border_strong)
+        } else {
+            PostMsgAction::None
+        };
         self.recompute_layout(&snapshot);
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
+        post
     }
 
     fn refresh(&mut self, hwnd: HWND) {
@@ -499,8 +650,9 @@ impl WindowData {
             return;
         }
         if should_unmute {
-            self.shared.audio.apply_action_async(AppAction::ToggleMute {
+            self.shared.audio.apply_action_async(AppAction::SetMute {
                 device_id: device_id.to_string(),
+                muted: false,
             });
         }
         if volume_changed {
@@ -554,7 +706,7 @@ impl WindowData {
         self.refresh(hwnd);
     }
 
-    fn handle_click(&mut self, hwnd: HWND, x: i32, y: i32) {
+    fn handle_click(&mut self, hwnd: HWND, x: i32, y: i32) -> PostMsgAction {
         let hit_action = self
             .layout
             .as_ref()
@@ -578,7 +730,7 @@ impl WindowData {
             if dirty {
                 self.refresh(hwnd);
             }
-            return;
+            return PostMsgAction::None;
         };
 
         let cleared_confirm_quit = !matches!(action, HitAction::ConfigQuit)
@@ -589,7 +741,7 @@ impl WindowData {
             HitAction::ToggleLock => {
                 let next = !state.lock_enabled;
                 let msg = if next { "Lock enabled" } else { "Lock paused" };
-                self.dispatch(hwnd, AppAction::SetLockEnabled(next), Some(msg.to_string()));
+                self.dispatch(hwnd, AppAction::SetLockEnabled(next), Some(msg.to_string()))
             }
             HitAction::ToggleConfig => {
                 self.saving_profile = false;
@@ -602,6 +754,7 @@ impl WindowData {
                     _ => ActiveOverlay::Config,
                 };
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::TogglePin => {
                 self.pinned = !self.pinned;
@@ -612,6 +765,7 @@ impl WindowData {
                 };
                 self.flash_status(hwnd, msg);
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::ToggleTheme => {
                 let next = match state.theme {
@@ -622,7 +776,7 @@ impl WindowData {
                     ThemeMode::Dark => "Switched to Dark mode",
                     ThemeMode::Light => "Switched to Light mode",
                 };
-                self.dispatch(hwnd, AppAction::SetTheme(next), Some(msg.to_string()));
+                self.dispatch(hwnd, AppAction::SetTheme(next), Some(msg.to_string()))
             }
             HitAction::ToggleProfileMenu => {
                 self.saving_profile = false;
@@ -635,6 +789,7 @@ impl WindowData {
                     _ => ActiveOverlay::ProfileMenu,
                 };
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::ToggleSaveProfileBar => {
                 self.active_overlay = ActiveOverlay::None;
@@ -648,6 +803,7 @@ impl WindowData {
                     self.active_input = ActiveInput::None;
                 }
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::FocusSaveProfileInput => {
                 self.active_overlay = ActiveOverlay::None;
@@ -655,12 +811,15 @@ impl WindowData {
                 self.active_input = ActiveInput::SaveProfile;
                 self.input_selected_all = false;
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::CommitSaveProfile => {
                 self.commit_save_profile(hwnd);
+                PostMsgAction::None
             }
             HitAction::CancelSaveProfile => {
                 self.cancel_save_profile(hwnd);
+                PostMsgAction::None
             }
             HitAction::SetTab(flow) => {
                 if self.active_tab != flow {
@@ -676,6 +835,7 @@ impl WindowData {
                 } else if cleared_confirm_quit {
                     self.refresh(hwnd);
                 }
+                PostMsgAction::None
             }
             HitAction::FocusSearch => {
                 self.active_overlay = ActiveOverlay::None;
@@ -683,6 +843,7 @@ impl WindowData {
                 self.active_input = ActiveInput::Search;
                 self.input_selected_all = false;
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::ClearSearch | HitAction::EmptyClearSearch => {
                 self.search_query.clear();
@@ -690,6 +851,7 @@ impl WindowData {
                 self.active_input = ActiveInput::Search;
                 self.input_selected_all = false;
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::SetDefault { flow, device_id } => {
                 let name = self.device_name(&state, &device_id);
@@ -697,7 +859,7 @@ impl WindowData {
                     hwnd,
                     AppAction::SetDefault { flow, device_id },
                     Some(format!("Default: {name}")),
-                );
+                )
             }
             HitAction::SetComms { flow, device_id } => {
                 let name = self.device_name(&state, &device_id);
@@ -705,21 +867,21 @@ impl WindowData {
                     hwnd,
                     AppAction::SetComms { flow, device_id },
                     Some(format!("Communications: {name}")),
-                );
+                )
             }
             HitAction::VolumeBar(device_id) => {
                 if state.device(&device_id).is_some_and(|d| d.disabled) {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 }
                 let Some(bar_rect) = self.layout.as_ref().and_then(|l| l.slider_rect(&device_id))
                 else {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 };
                 self.active_overlay = ActiveOverlay::None;
                 self.listen_search_query.clear();
@@ -731,20 +893,21 @@ impl WindowData {
                     self.active_input = ActiveInput::None;
                 }
                 self.dragging_volume = Some((device_id.clone(), bar_rect));
-                unsafe {
-                    SetCapture(hwnd);
-                }
                 self.update_volume_from_x(hwnd, &device_id, bar_rect, x);
+                PostMsgAction::Capture
             }
             HitAction::ToggleMute(device_id) => {
-                let was_muted = state.device(&device_id).is_some_and(|d| d.muted);
+                let next_muted = !state.device(&device_id).is_some_and(|d| d.muted);
                 let name = self.device_name(&state, &device_id);
-                let verb = if was_muted { "Unmuted" } else { "Muted" };
+                let verb = if next_muted { "Muted" } else { "Unmuted" };
                 self.dispatch(
                     hwnd,
-                    AppAction::ToggleMute { device_id },
+                    AppAction::SetMute {
+                        device_id,
+                        muted: next_muted,
+                    },
                     Some(format!("{verb} {name}")),
-                );
+                )
             }
             HitAction::ToggleEnhancements(device_id) => {
                 let currently_disabled = state
@@ -763,17 +926,35 @@ impl WindowData {
                         disabled: next_disabled,
                     },
                     Some(msg.to_string()),
-                );
+                )
             }
             HitAction::ToggleDeviceDisabled(device_id) => {
                 if state.auto_disable_unused_devices {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 }
-                let next_disabled = !state.device(&device_id).is_some_and(|d| d.disabled);
-                let name = self.device_name(&state, &device_id);
+                let Some(dev) = state.device(&device_id) else {
+                    if cleared_confirm_quit {
+                        self.refresh(hwnd);
+                    }
+                    return PostMsgAction::None;
+                };
+                let next_disabled = !dev.disabled;
+                if next_disabled
+                    && state
+                        .devices
+                        .iter()
+                        .filter(|d| d.flow == dev.flow && !d.disabled)
+                        .count()
+                        <= 1
+                {
+                    self.flash_status(hwnd, "Can't disable last active device");
+                    self.refresh(hwnd);
+                    return PostMsgAction::None;
+                }
+                let name = dev.name.clone();
                 let msg = if next_disabled {
                     format!("Disabled {name}")
                 } else {
@@ -786,7 +967,7 @@ impl WindowData {
                         disabled: next_disabled,
                     },
                     Some(msg),
-                );
+                )
             }
             HitAction::ToggleDevicePin(device_id) => {
                 let next_pinned = !state.device(&device_id).is_some_and(|d| d.pinned);
@@ -794,9 +975,12 @@ impl WindowData {
                 let verb = if next_pinned { "Pinned" } else { "Unpinned" };
                 self.dispatch(
                     hwnd,
-                    AppAction::ToggleDevicePin { device_id },
+                    AppAction::SetDevicePinned {
+                        device_id,
+                        pinned: next_pinned,
+                    },
                     Some(format!("{verb} {name}")),
-                );
+                )
             }
             HitAction::ToggleListenEnabled(device_id) => {
                 let current = state
@@ -822,7 +1006,7 @@ impl WindowData {
                         enabled: next,
                     },
                     msg,
-                );
+                )
             }
             HitAction::ToggleListenMenu(device_id) => {
                 self.saving_profile = false;
@@ -841,6 +1025,7 @@ impl WindowData {
                     self.active_input = ActiveInput::ListenSearch;
                 }
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::DismissOverlay => {
                 if matches!(self.active_overlay, ActiveOverlay::ListenTarget(_)) {
@@ -850,12 +1035,14 @@ impl WindowData {
                     self.input_selected_all = false;
                     self.refresh(hwnd);
                 }
+                PostMsgAction::None
             }
             HitAction::OverlaySurface => {
                 if self.input_selected_all || cleared_confirm_quit {
                     self.input_selected_all = false;
                     self.refresh(hwnd);
                 }
+                PostMsgAction::None
             }
             HitAction::ConfigSeparateComms => {
                 let next = !state.separate_comms_role;
@@ -868,7 +1055,7 @@ impl WindowData {
                     hwnd,
                     AppAction::SetSeparateCommsRole(next),
                     Some(msg.to_string()),
-                );
+                )
             }
             HitAction::ConfigAutoDisableEnhancements => {
                 let next = !state.auto_disable_enhancements;
@@ -881,15 +1068,13 @@ impl WindowData {
                     hwnd,
                     AppAction::SetAutoDisableEnhancements(next),
                     Some(msg.to_string()),
-                );
+                )
             }
-            HitAction::ConfigReenableEnhancements => {
-                self.dispatch(
-                    hwnd,
-                    AppAction::ReenableAllEnhancements,
-                    Some("Re-enabled enhancements".to_string()),
-                );
-            }
+            HitAction::ConfigReenableEnhancements => self.dispatch(
+                hwnd,
+                AppAction::ReenableAllEnhancements,
+                Some("Re-enabled enhancements".to_string()),
+            ),
             HitAction::ConfigAutoDisableUnused => {
                 let next = !state.auto_disable_unused_devices;
                 let msg = if next {
@@ -901,21 +1086,19 @@ impl WindowData {
                     hwnd,
                     AppAction::SetAutoDisableUnusedDevices(next),
                     Some(msg.to_string()),
-                );
+                )
             }
-            HitAction::ConfigReenableDevices => {
-                self.dispatch(
-                    hwnd,
-                    AppAction::ReenableAllDevices,
-                    Some("Re-enabled all devices".to_string()),
-                );
-            }
+            HitAction::ConfigReenableDevices => self.dispatch(
+                hwnd,
+                AppAction::ReenableAllDevices,
+                Some("Re-enabled all devices".to_string()),
+            ),
             HitAction::ConfigRightClick(rc_action) => {
                 if state.right_click_action == rc_action {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 }
                 let msg = match rc_action {
                     RightClickAction::Menu => "Tray right-click: Quick menu",
@@ -925,7 +1108,7 @@ impl WindowData {
                     hwnd,
                     AppAction::SetRightClickAction(rc_action),
                     Some(msg.to_string()),
-                );
+                )
             }
             HitAction::ConfigRunOnStartup => {
                 let next = !state.run_on_startup;
@@ -938,7 +1121,7 @@ impl WindowData {
                     hwnd,
                     AppAction::SetRunOnStartup(next),
                     Some(msg.to_string()),
-                );
+                )
             }
             HitAction::ConfigAutoUpdate => {
                 let next = !state.auto_update;
@@ -947,21 +1130,23 @@ impl WindowData {
                 } else {
                     "Auto-update disabled"
                 };
-                self.dispatch(hwnd, AppAction::SetAutoUpdate(next), Some(msg.to_string()));
+                self.dispatch(hwnd, AppAction::SetAutoUpdate(next), Some(msg.to_string()))
             }
             HitAction::ConfigApplyStagedUpdate => {
                 self.flash_status(hwnd, "Applying update...");
+                self.refresh(hwnd);
                 self.shared.push_event(FlyoutEvent::ApplyStagedUpdate);
-                request_close(hwnd);
+                PostMsgAction::None
             }
             HitAction::ConfigQuit => {
                 if self.confirm_quit {
                     self.confirm_quit = false;
                     self.shared.push_event(FlyoutEvent::Quit);
-                    request_close(hwnd);
+                    PostMsgAction::Close
                 } else {
                     self.confirm_quit = true;
                     self.refresh(hwnd);
+                    PostMsgAction::None
                 }
             }
             HitAction::ApplyProfile(profile_id) => {
@@ -974,7 +1159,7 @@ impl WindowData {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 };
                 self.active_overlay = ActiveOverlay::None;
                 self.input_selected_all = false;
@@ -982,7 +1167,7 @@ impl WindowData {
                     hwnd,
                     AppAction::ApplyProfile { profile_id },
                     Some(format!("Loaded {name}")),
-                );
+                )
             }
             HitAction::DeleteProfile(profile_id) => {
                 let Some(name) = state
@@ -994,18 +1179,19 @@ impl WindowData {
                     if cleared_confirm_quit {
                         self.refresh(hwnd);
                     }
-                    return;
+                    return PostMsgAction::None;
                 };
                 self.dispatch(
                     hwnd,
                     AppAction::DeleteProfile { profile_id },
                     Some(format!("Deleted profile '{name}'")),
-                );
+                )
             }
             HitAction::FocusListenSearch => {
                 self.active_input = ActiveInput::ListenSearch;
                 self.input_selected_all = false;
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::ClearListenSearch => {
                 self.listen_search_query.clear();
@@ -1013,6 +1199,7 @@ impl WindowData {
                 self.active_input = ActiveInput::ListenSearch;
                 self.input_selected_all = false;
                 self.refresh(hwnd);
+                PostMsgAction::None
             }
             HitAction::SetListenTarget {
                 device_id,
@@ -1036,12 +1223,48 @@ impl WindowData {
                         target_device_id: target_id,
                     },
                     Some(msg),
-                );
+                )
             }
         }
     }
 
-    fn handle_key_down(&mut self, hwnd: HWND, vk: u16) -> bool {
+    fn apply_pasted_text(&mut self, hwnd: HWND, pasted: &str) {
+        if self.active_input == ActiveInput::None {
+            return;
+        }
+        let cleaned: String = pasted
+            .chars()
+            .filter(|ch| *ch != '\r' && *ch != '\n' && !ch.is_control())
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        let replace = self.input_selected_all;
+        self.input_selected_all = false;
+        let max_len = self.active_input_max_len();
+        let target = self.active_input_mut();
+        let mut changed = false;
+        if replace && !target.is_empty() {
+            target.clear();
+            changed = true;
+        }
+        let mut current_len = target.chars().count();
+        for ch in cleaned.chars() {
+            if current_len < max_len {
+                target.push(ch);
+                current_len += 1;
+                changed = true;
+            } else {
+                break;
+            }
+        }
+        if changed || replace {
+            self.reset_scroll_for_active_input();
+            self.refresh(hwnd);
+        }
+    }
+
+    fn handle_key_down(&mut self, hwnd: HWND, vk: u16) -> (bool, PostMsgAction) {
         if vk == VK_ESCAPE.0 {
             self.input_selected_all = false;
             if matches!(self.active_overlay, ActiveOverlay::ListenTarget(_)) {
@@ -1069,13 +1292,13 @@ impl WindowData {
                 self.active_input = ActiveInput::None;
                 self.refresh(hwnd);
             } else {
-                request_close(hwnd);
+                return (true, PostMsgAction::Close);
             }
-            return true;
+            return (true, PostMsgAction::None);
         }
 
         if self.active_input == ActiveInput::None {
-            return false;
+            return (false, PostMsgAction::None);
         }
 
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -1088,48 +1311,19 @@ impl WindowData {
                         self.input_selected_all = true;
                         self.refresh(hwnd);
                     }
-                    return true;
+                    return (true, PostMsgAction::None);
                 }
                 0x43 => {
                     let text = self.active_input_str().to_string();
-                    if !text.is_empty() {
-                        write_clipboard_text(hwnd, &text);
-                    }
-                    return true;
+                    let post = if text.is_empty() {
+                        PostMsgAction::None
+                    } else {
+                        PostMsgAction::CopyClipboard(text)
+                    };
+                    return (true, post);
                 }
                 0x56 => {
-                    if let Some(pasted) = read_clipboard_text(hwnd) {
-                        let cleaned: String = pasted
-                            .chars()
-                            .filter(|ch| *ch != '\r' && *ch != '\n' && !ch.is_control())
-                            .collect();
-                        if !cleaned.is_empty() {
-                            let replace = self.input_selected_all;
-                            self.input_selected_all = false;
-                            let max_len = self.active_input_max_len();
-                            let target = self.active_input_mut();
-                            let mut changed = false;
-                            if replace && !target.is_empty() {
-                                target.clear();
-                                changed = true;
-                            }
-                            let mut current_len = target.chars().count();
-                            for ch in cleaned.chars() {
-                                if current_len < max_len {
-                                    target.push(ch);
-                                    current_len += 1;
-                                    changed = true;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if changed || replace {
-                                self.reset_scroll_for_active_input();
-                                self.refresh(hwnd);
-                            }
-                        }
-                    }
-                    return true;
+                    return (true, PostMsgAction::PasteClipboard);
                 }
                 v if v == VK_BACK.0 => {
                     let was_selected = self.input_selected_all;
@@ -1141,13 +1335,13 @@ impl WindowData {
                         self.reset_scroll_for_active_input();
                         self.refresh(hwnd);
                     }
-                    return true;
+                    return (true, PostMsgAction::None);
                 }
-                _ => return false,
+                _ => return (false, PostMsgAction::None),
             }
         }
 
-        match vk {
+        let handled = match vk {
             v if v == VK_RETURN.0 => {
                 if self.active_input == ActiveInput::SaveProfile {
                     self.commit_save_profile(hwnd);
@@ -1188,7 +1382,8 @@ impl WindowData {
                 true
             }
             _ => false,
-        }
+        };
+        (handled, PostMsgAction::None)
     }
 
     fn handle_char(&mut self, hwnd: HWND, code_unit: u16) {
@@ -1198,7 +1393,7 @@ impl WindowData {
         }
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
-        if ctrl || alt {
+        if ctrl && !alt {
             self.pending_high_surrogate = None;
             return;
         }
@@ -1384,25 +1579,54 @@ fn request_close(hwnd: HWND) {
     if ptr.is_null() {
         return;
     }
-    let should_destroy = {
+    let (should_destroy, should_release_capture) = {
         let data = unsafe { &mut *ptr };
         if data.is_closing {
-            false
+            (false, false)
         } else {
             data.is_closing = true;
             data.confirm_quit = false;
-            if data.dragging_volume.take().is_some() {
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
-            }
-            true
+            let had_drag = data.dragging_volume.take().is_some();
+            (true, had_drag)
         }
     };
+    if should_release_capture {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
     if should_destroy {
         unsafe {
             let _ = KillTimer(Some(hwnd), STATUS_TIMER_ID);
             let _ = DestroyWindow(hwnd);
+        }
+    }
+}
+
+fn run_post_action(hwnd: HWND, action: PostMsgAction) {
+    match action {
+        PostMsgAction::None => {}
+        PostMsgAction::Close => request_close(hwnd),
+        PostMsgAction::Capture => unsafe {
+            SetCapture(hwnd);
+        },
+        PostMsgAction::ReleaseCapture => unsafe {
+            let _ = ReleaseCapture();
+        },
+        PostMsgAction::DwmBorder(border) => {
+            let _ = apply_dwm_chrome(hwnd, border);
+        }
+        PostMsgAction::CopyClipboard(text) => {
+            write_clipboard_text(hwnd, &text);
+        }
+        PostMsgAction::PasteClipboard => {
+            if let Some(pasted) = read_clipboard_text(hwnd) {
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowData;
+                if !ptr.is_null() {
+                    let data = unsafe { &mut *ptr };
+                    data.apply_pasted_text(hwnd, &pasted);
+                }
+            }
         }
     }
 }
@@ -1443,12 +1667,17 @@ fn read_clipboard_text(hwnd: HWND) -> Option<String> {
         let result = (|| {
             let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
             let hmem = HGLOBAL(handle.0);
+            let byte_len = GlobalSize(hmem);
+            let max_units = (byte_len / size_of::<u16>()).min(1024);
+            if max_units == 0 {
+                return None;
+            }
             let ptr = GlobalLock(hmem).cast::<u16>();
             if ptr.is_null() {
                 return None;
             }
             let mut len = 0usize;
-            while len < 1024 && *ptr.add(len) != 0 {
+            while len < max_units && *ptr.add(len) != 0 {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -1549,15 +1778,17 @@ unsafe extern "system" fn flyout_wnd_proc(
         }
         WM_SETCURSOR => {
             if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
-                let data = unsafe { &*ptr };
-                let cursor_id = if data.dragging_volume.is_some() {
-                    IDC_SIZEWE
-                } else {
-                    match data.hovered_cursor {
-                        CursorKind::Arrow => IDC_ARROW,
-                        CursorKind::Hand => IDC_HAND,
-                        CursorKind::IBeam => IDC_IBEAM,
-                        CursorKind::ResizeEW => IDC_SIZEWE,
+                let cursor_id = {
+                    let data = unsafe { &*ptr };
+                    if data.dragging_volume.is_some() {
+                        IDC_SIZEWE
+                    } else {
+                        match data.hovered_cursor {
+                            CursorKind::Arrow => IDC_ARROW,
+                            CursorKind::Hand => IDC_HAND,
+                            CursorKind::IBeam => IDC_IBEAM,
+                            CursorKind::ResizeEW => IDC_SIZEWE,
+                        }
                     }
                 };
                 unsafe {
@@ -1571,24 +1802,37 @@ unsafe extern "system" fn flyout_wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lparam);
-            let data = unsafe { &mut *ptr };
-            data.last_mouse = Some((x, y));
-            data.handle_click(hwnd, x, y);
+            let post_action = {
+                let data = unsafe { &mut *ptr };
+                data.last_mouse = Some((x, y));
+                data.handle_click(hwnd, x, y)
+            };
+            run_post_action(hwnd, post_action);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let data = unsafe { &mut *ptr };
-            if data.dragging_volume.take().is_some() {
+            let post_action = {
+                let data = unsafe { &mut *ptr };
+                if data.dragging_volume.take().is_some() {
+                    PostMsgAction::ReleaseCapture
+                } else {
+                    PostMsgAction::None
+                }
+            };
+            if matches!(post_action, PostMsgAction::ReleaseCapture) {
+                run_post_action(hwnd, post_action);
                 unsafe {
-                    let _ = ReleaseCapture();
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            let data = unsafe { &mut *ptr };
-            if data.dragging_volume.take().is_some() {
+            let had_drag = {
+                let data = unsafe { &mut *ptr };
+                data.dragging_volume.take().is_some()
+            };
+            if had_drag {
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -1597,14 +1841,20 @@ unsafe extern "system" fn flyout_wnd_proc(
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let data = unsafe { &mut *ptr };
-            data.handle_wheel(hwnd, delta);
+            {
+                let data = unsafe { &mut *ptr };
+                data.handle_wheel(hwnd, delta);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             let vk = (wparam.0 & 0xFFFF) as u16;
-            let data = unsafe { &mut *ptr };
-            if data.handle_key_down(hwnd, vk) {
+            let (handled, post_action) = {
+                let data = unsafe { &mut *ptr };
+                data.handle_key_down(hwnd, vk)
+            };
+            run_post_action(hwnd, post_action);
+            if handled {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1612,8 +1862,10 @@ unsafe extern "system" fn flyout_wnd_proc(
         }
         WM_CHAR => {
             let code_unit = (wparam.0 & 0xFFFF) as u16;
-            let data = unsafe { &mut *ptr };
-            data.handle_char(hwnd, code_unit);
+            {
+                let data = unsafe { &mut *ptr };
+                data.handle_char(hwnd, code_unit);
+            }
             LRESULT(0)
         }
         WM_TIMER => {
@@ -1621,15 +1873,55 @@ unsafe extern "system" fn flyout_wnd_proc(
                 unsafe {
                     let _ = KillTimer(Some(hwnd), STATUS_TIMER_ID);
                 }
-                let data = unsafe { &mut *ptr };
-                data.status_text = "Auto-saved".to_string();
-                data.status_flash = false;
+                {
+                    let data = unsafe { &mut *ptr };
+                    data.status_text = "Auto-saved".to_string();
+                    data.status_flash = false;
+                }
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DPICHANGED => {
+            let new_dpi = (wparam.0 & 0xFFFF) as u32;
+            let new_scale = if new_dpi > 0 {
+                new_dpi as f32 / 96.0
+            } else {
+                1.0
+            };
+            let suggested_ptr = lparam.0 as *const RECT;
+            let suggested = (!suggested_ptr.is_null()).then(|| unsafe { *suggested_ptr });
+            let target_rect = {
+                let data = unsafe { &mut *ptr };
+                let (w, h, pos) = if let Some(rc) = suggested {
+                    let rw = (rc.right - rc.left).max(1);
+                    let rh = (rc.bottom - rc.top).max(1);
+                    (rw, rh, Some((rc.left, rc.top, rw, rh)))
+                } else {
+                    let rw = px(FLYOUT_WIDTH_LOGICAL, new_scale).max(1);
+                    let rh = px(FLYOUT_HEIGHT_LOGICAL, new_scale).max(1);
+                    (rw, rh, None)
+                };
+                data.scale = new_scale;
+                data.width = w;
+                data.height = h;
+                data.fonts = FontCache::new(new_scale);
+                let snapshot = data.snapshot();
+                data.recompute_layout(&snapshot);
+                pos
+            };
+            if let Some((x, y, w, h)) = target_rect {
+                unsafe {
+                    let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
         }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
@@ -1662,11 +1954,9 @@ fn paint_flyout(hwnd: HWND, data: &mut WindowData) {
     if data.layout.is_none() {
         data.recompute_layout(&snapshot);
     }
-    let Some(ref layout) = data.layout else {
+    let Some((width, height)) = data.layout.as_ref().map(|l| (l.width, l.height)) else {
         return;
     };
-    let width = layout.width;
-    let height = layout.height;
     let scale = data.scale;
     let theme = Theme::from_mode(snapshot.theme);
 
@@ -1679,51 +1969,21 @@ fn paint_flyout(hwnd: HWND, data: &mut WindowData) {
         return;
     }
 
-    let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
-    if mem_dc.is_invalid() {
+    if !data.backbuffer.ensure(hdc, width, height) {
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
         return;
     }
 
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    let Ok(hbitmap) =
-        (unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) })
-    else {
+    let mem_dc = data.backbuffer.mem_dc;
+    let pixels_ptr = data.backbuffer.pixels.cast::<u8>();
+    let Some(ref layout) = data.layout else {
         unsafe {
-            let _ = DeleteDC(mem_dc);
             let _ = EndPaint(hwnd, &ps);
         }
         return;
     };
-
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(hbitmap.0));
-            let _ = DeleteDC(mem_dc);
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
-    }
-
-    let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(hbitmap.0)) };
-    unsafe {
-        SetBkMode(mem_dc, TRANSPARENT);
-    }
 
     let byte_len = (width as usize) * (height as usize) * 4;
     let search_text_w = measure_text_width(
@@ -1743,8 +2003,11 @@ fn paint_flyout(hwnd: HWND, data: &mut WindowData) {
     );
 
     // Pass 1: Base layer pixels (shapes + icons)
+    unsafe {
+        let _ = GdiFlush();
+    }
     {
-        let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), byte_len) };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(pixels_ptr, byte_len) };
         let mut canvas = Canvas::new(pixels, width, height);
         paint_base_shapes(
             &mut canvas,
@@ -1767,7 +2030,7 @@ fn paint_flyout(hwnd: HWND, data: &mut WindowData) {
             let _ = GdiFlush();
         }
         {
-            let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), byte_len) };
+            let pixels = unsafe { std::slice::from_raw_parts_mut(pixels_ptr, byte_len) };
             let mut canvas = Canvas::new(pixels, width, height);
             paint_overlay_shapes(
                 &mut canvas,
@@ -1784,9 +2047,6 @@ fn paint_flyout(hwnd: HWND, data: &mut WindowData) {
 
     unsafe {
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(HGDIOBJ(hbitmap.0));
-        let _ = DeleteDC(mem_dc);
         let _ = EndPaint(hwnd, &ps);
     }
 }

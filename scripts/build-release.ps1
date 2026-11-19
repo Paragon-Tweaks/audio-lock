@@ -13,13 +13,57 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 function Get-CargoVersion {
     param([string]$CargoTomlPath)
     $content = Get-Content -Path $CargoTomlPath -Raw
-    if ($content -match '(?ms)^\[workspace\.package\].*?^\s*version\s*=\s*"([^"]+)"') {
-        return $Matches[1]
+    if ($content -match '(?ms)^\[workspace\.package\]\s*\r?\n(.*?)(?=^\[|\z)' -and $Matches[1] -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
+        return $Matches[1].Trim()
     }
-    if ($content -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
-        return $Matches[1]
+    throw "Could not determine [workspace.package].version from $CargoTomlPath"
+}
+
+function Resolve-AssetUrl {
+    param(
+        [string]$ReleaseVersion,
+        [string]$RepoParam,
+        [string]$RepoEnv,
+        [string]$ManifestUrlParam
+    )
+
+    $usageMessage = "Provide -GithubRepo <owner/repo>, set AUDIO_LOCK_GITHUB_REPO=<owner/repo>, or pass -ManifestUrl <https://.../manifest.json or loopback http://.../manifest.json>."
+
+    $repoCandidate = $null
+    $repoSource = $null
+    if (-not [string]::IsNullOrWhiteSpace($RepoParam)) {
+        $repoCandidate = $RepoParam
+        $repoSource = "-GithubRepo"
+    } elseif (-not [string]::IsNullOrWhiteSpace($RepoEnv)) {
+        $repoCandidate = $RepoEnv
+        $repoSource = "AUDIO_LOCK_GITHUB_REPO"
     }
-    throw "Could not determine version from $CargoTomlPath"
+
+    if ($null -ne $repoCandidate) {
+        $repoSlug = $repoCandidate.Trim().Trim('/')
+        if ($repoSlug -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or $repoSlug.StartsWith('OWNER/', [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Invalid repository slug '$repoCandidate' from $repoSource. Expected '<owner>/<repo>'. $usageMessage"
+        }
+        return "https://github.com/$repoSlug/releases/download/v$ReleaseVersion/default-audio-lock-win64-update.zip"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ManifestUrlParam)) {
+        $trimmedManifest = $ManifestUrlParam.Trim()
+        $parsedUri = $null
+        if (-not [System.Uri]::TryCreate($trimmedManifest, [System.UriKind]::Absolute, [ref]$parsedUri)) {
+            throw "Invalid -ManifestUrl '$ManifestUrlParam'. Expected a valid absolute https:// or loopback http:// URL. $usageMessage"
+        }
+
+        $isHttps = $parsedUri.Scheme -eq 'https'
+        $isLoopbackHttp = ($parsedUri.Scheme -eq 'http') -and $parsedUri.IsLoopback
+        if (-not ($isHttps -or $isLoopbackHttp) -or [string]::IsNullOrWhiteSpace($parsedUri.Host)) {
+            throw "Invalid -ManifestUrl '$ManifestUrlParam'. Only https:// or loopback http:// URLs are allowed. $usageMessage"
+        }
+
+        return ([System.Uri]::new($parsedUri, "default-audio-lock-win64-update.zip")).AbsoluteUri
+    }
+
+    throw "Cannot determine an absolute asset_url for manifest.json. $usageMessage"
 }
 
 function Find-Iscc {
@@ -46,10 +90,21 @@ $prevGithubRepo = $env:AUDIO_LOCK_GITHUB_REPO
 $prevManifestUrl = $env:AUDIO_LOCK_UPDATE_MANIFEST_URL
 
 try {
+    $CargoVersion = Get-CargoVersion -CargoTomlPath (Join-Path $RepoRoot "Cargo.toml")
     if ([string]::IsNullOrWhiteSpace($Version)) {
-        $Version = Get-CargoVersion -CargoTomlPath (Join-Path $RepoRoot "Cargo.toml")
+        $Version = $CargoVersion
+    } else {
+        $Version = $Version.Trim().TrimStart('v', 'V')
+        if ($Version -ne $CargoVersion) {
+            throw "Version mismatch: -Version '$Version' does not match Cargo.toml [workspace.package].version '$CargoVersion'."
+        }
     }
-    $Version = $Version.Trim().TrimStart('v', 'V')
+
+    $AssetUrl = Resolve-AssetUrl `
+        -ReleaseVersion $Version `
+        -RepoParam $GithubRepo `
+        -RepoEnv $prevGithubRepo `
+        -ManifestUrlParam $ManifestUrl
 
     if ($PSBoundParameters.ContainsKey("GithubRepo")) {
         $env:AUDIO_LOCK_GITHUB_REPO = $GithubRepo
@@ -78,15 +133,6 @@ try {
 
     $Sha256 = (Get-FileHash -Path $UpdateZip -Algorithm SHA256).Hash.ToLowerInvariant()
     $PublishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-    if (-not [string]::IsNullOrWhiteSpace($GithubRepo)) {
-        $RepoSlug = $GithubRepo.Trim('/')
-        $AssetUrl = "https://github.com/$RepoSlug/releases/download/v$Version/default-audio-lock-win64-update.zip"
-    } elseif (-not [string]::IsNullOrWhiteSpace($ManifestUrl) -and $ManifestUrl -match '/manifest\.json$') {
-        $AssetUrl = $ManifestUrl -replace '/manifest\.json$', '/default-audio-lock-win64-update.zip'
-    } else {
-        $AssetUrl = "default-audio-lock-win64-update.zip"
-    }
 
     $ManifestObj = [ordered]@{
         version      = $Version

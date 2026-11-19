@@ -14,13 +14,14 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, BeginPaint, CLEARTYPE_QUALITY,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET,
     DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, EndPaint, FF_SWISS, FW_BOLD, FW_NORMAL,
-    FW_SEMIBOLD, GetMonitorInfoW, GetTextExtentPoint32W, HFONT, HGDIOBJ, IntersectClipRect,
-    InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, OUT_TT_PRECIS,
-    PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    FW_SEMIBOLD, GdiFlush, GetMonitorInfoW, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ,
+    IntersectClipRect, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
+    OUT_TT_PRECIS, PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -31,10 +32,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrW, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND, LoadCursorW, RegisterClassW,
-    SW_SHOW, SWP_NOACTIVATE, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -185,6 +187,8 @@ impl PopupMenu {
             anchor,
             scale: final_scale,
             layout: final_layout,
+            fonts: MenuFonts::new(final_scale),
+            backbuffer: DibBackbuffer::empty(),
             scroll_offset: 0,
             hovered: None,
             pressed: None,
@@ -232,8 +236,10 @@ impl PopupMenu {
         if ptr.is_null() {
             return;
         }
-        let border_color = {
+        let (border_color, resize_info) = {
             let data = unsafe { &mut *ptr };
+            let old_w = data.layout.width;
+            let old_h = data.layout.height;
             let snapshot = data
                 .shared
                 .state
@@ -242,8 +248,35 @@ impl PopupMenu {
                 .clone();
             data.layout = MenuLayout::compute(&snapshot, data.scale, data.scroll_offset);
             data.scroll_offset = data.scroll_offset.clamp(0, data.layout.max_scroll);
-            MenuPalette::from_mode(snapshot.theme).border_strong
+            let new_w = data.layout.width;
+            let new_h = data.layout.height;
+            let resize_info = (new_w != old_w || new_h != old_h)
+                .then_some((data.anchor, data.scale, new_w, new_h));
+            (MenuPalette::from_mode(snapshot.theme).border_strong, resize_info)
         };
+        if let Some((anchor, scale, new_w, new_h)) = resize_info {
+            let monitor = unsafe {
+                MonitorFromPoint(
+                    POINT {
+                        x: anchor.0,
+                        y: anchor.1,
+                    },
+                    MONITOR_DEFAULTTOPRIMARY,
+                )
+            };
+            let (x, y) = compute_window_position(monitor, anchor, new_w, new_h, scale);
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    new_w,
+                    new_h,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+        }
         let _ = apply_dwm_chrome(hwnd, border_color);
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -261,11 +294,164 @@ impl Drop for PopupMenu {
     }
 }
 
+struct MenuFonts {
+    regular: HFONT,
+    semibold: HFONT,
+    profile_regular: HFONT,
+    profile_active: HFONT,
+    header: HFONT,
+    badge: HFONT,
+}
+
+impl MenuFonts {
+    fn new(scale: f32) -> Self {
+        Self {
+            regular: create_ui_font(12.5, scale, FW_NORMAL.0 as i32),
+            semibold: create_ui_font(12.5, scale, FW_SEMIBOLD.0 as i32),
+            profile_regular: create_ui_font(12.0, scale, FW_NORMAL.0 as i32),
+            profile_active: create_ui_font(12.0, scale, FW_SEMIBOLD.0 as i32),
+            header: create_ui_font(10.0, scale, FW_SEMIBOLD.0 as i32),
+            badge: create_ui_font(9.5, scale, FW_BOLD.0 as i32),
+        }
+    }
+
+    fn release(&mut self) {
+        for font in [
+            &mut self.regular,
+            &mut self.semibold,
+            &mut self.profile_regular,
+            &mut self.profile_active,
+            &mut self.header,
+            &mut self.badge,
+        ] {
+            if !font.is_invalid() {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(font.0));
+                }
+                *font = HFONT::default();
+            }
+        }
+    }
+}
+
+struct DibBackbuffer {
+    mem_dc: HDC,
+    dib: HBITMAP,
+    old_obj: HGDIOBJ,
+    pixels: *mut u32,
+    buf_w: i32,
+    buf_h: i32,
+}
+
+impl DibBackbuffer {
+    fn empty() -> Self {
+        Self {
+            mem_dc: HDC::default(),
+            dib: HBITMAP::default(),
+            old_obj: HGDIOBJ::default(),
+            pixels: std::ptr::null_mut(),
+            buf_w: 0,
+            buf_h: 0,
+        }
+    }
+
+    fn ensure(&mut self, hdc: HDC, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        if !self.mem_dc.is_invalid()
+            && !self.dib.0.is_null()
+            && !self.pixels.is_null()
+            && self.buf_w == width
+            && self.buf_h == height
+        {
+            return true;
+        }
+
+        self.release();
+
+        let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
+        if mem_dc.is_invalid() {
+            return false;
+        }
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let Ok(dib) =
+            (unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) })
+        else {
+            unsafe {
+                let _ = DeleteDC(mem_dc);
+            }
+            return false;
+        };
+
+        if bits.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(dib.0));
+                let _ = DeleteDC(mem_dc);
+            }
+            return false;
+        }
+
+        let old_obj = unsafe { SelectObject(mem_dc, HGDIOBJ(dib.0)) };
+        unsafe {
+            SetBkMode(mem_dc, TRANSPARENT);
+        }
+
+        self.mem_dc = mem_dc;
+        self.dib = dib;
+        self.old_obj = old_obj;
+        self.pixels = bits.cast::<u32>();
+        self.buf_w = width;
+        self.buf_h = height;
+        true
+    }
+
+    fn release(&mut self) {
+        if !self.mem_dc.is_invalid() {
+            unsafe {
+                if !self.old_obj.0.is_null() {
+                    SelectObject(self.mem_dc, self.old_obj);
+                }
+                if !self.dib.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(self.dib.0));
+                }
+                let _ = DeleteDC(self.mem_dc);
+            }
+        } else if !self.dib.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            }
+        }
+        self.mem_dc = HDC::default();
+        self.dib = HBITMAP::default();
+        self.old_obj = HGDIOBJ::default();
+        self.pixels = std::ptr::null_mut();
+        self.buf_w = 0;
+        self.buf_h = 0;
+    }
+}
+
 struct WindowData {
     shared: Rc<PopupShared>,
     anchor: (i32, i32),
     scale: f32,
     layout: MenuLayout,
+    fonts: MenuFonts,
+    backbuffer: DibBackbuffer,
     scroll_offset: i32,
     hovered: Option<HitItem>,
     pressed: Option<HitItem>,
@@ -273,6 +459,13 @@ struct WindowData {
     tracking_mouse: bool,
     dwm_border_ok: bool,
     is_closing: bool,
+}
+
+impl Drop for WindowData {
+    fn drop(&mut self) {
+        self.backbuffer.release();
+        self.fonts.release();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -681,7 +874,7 @@ unsafe extern "system" fn popup_wnd_proc(
     match msg {
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
-            paint_menu(hwnd, unsafe { &*ptr });
+            paint_menu(hwnd, unsafe { &mut *ptr });
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -888,7 +1081,7 @@ unsafe extern "system" fn popup_wnd_proc(
     }
 }
 
-fn paint_menu(hwnd: HWND, data: &WindowData) {
+fn paint_menu(hwnd: HWND, data: &mut WindowData) {
     let snapshot = data
         .shared
         .state
@@ -897,9 +1090,8 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
         .clone();
     let palette = MenuPalette::from_mode(snapshot.theme);
     let scale = data.scale;
-    let layout = &data.layout;
-    let width = layout.width;
-    let height = layout.height;
+    let width = data.layout.width;
+    let height = data.layout.height;
 
     let mut ps = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -910,62 +1102,27 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
         return;
     }
 
-    let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
-    if mem_dc.is_invalid() {
+    if !data.backbuffer.ensure(hdc, width, height) {
         unsafe {
             let _ = EndPaint(hwnd, &ps);
         }
         return;
     }
 
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    let Ok(hbitmap) =
-        (unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) })
-    else {
-        unsafe {
-            let _ = DeleteDC(mem_dc);
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
-    };
-
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(hbitmap.0));
-            let _ = DeleteDC(mem_dc);
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
-    }
-
-    let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(hbitmap.0)) };
-
-    let font_regular = create_ui_font(12.5, scale, FW_NORMAL.0 as i32);
-    let font_semibold = create_ui_font(12.5, scale, FW_SEMIBOLD.0 as i32);
-    let font_profile_regular = create_ui_font(12.0, scale, FW_NORMAL.0 as i32);
-    let font_profile_active = create_ui_font(12.0, scale, FW_SEMIBOLD.0 as i32);
-    let font_header = create_ui_font(10.0, scale, FW_SEMIBOLD.0 as i32);
-    let font_badge = create_ui_font(9.5, scale, FW_BOLD.0 as i32);
+    let mem_dc = data.backbuffer.mem_dc;
+    let pixels_ptr = data.backbuffer.pixels.cast::<u8>();
+    let layout = &data.layout;
+    let fonts = &data.fonts;
 
     let badge_text = if snapshot.lock_enabled { "ON" } else { "OFF" };
-    let badge_rect = compute_badge_rect(mem_dc, font_badge, badge_text, layout.lock_row, scale);
+    let badge_rect = compute_badge_rect(mem_dc, fonts.badge, badge_text, layout.lock_row, scale);
 
+    unsafe {
+        let _ = GdiFlush();
+    }
     {
         let byte_len = (width as usize) * (height as usize) * 4;
-        let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), byte_len) };
+        let pixels = unsafe { std::slice::from_raw_parts_mut(pixels_ptr, byte_len) };
         let mut canvas = Canvas {
             pixels,
             width,
@@ -1110,10 +1267,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
         );
     }
 
-    unsafe {
-        SetBkMode(mem_dc, TRANSPARENT);
-    }
-    let old_font = unsafe { SelectObject(mem_dc, HGDIOBJ(font_regular.0)) };
+    let old_font = unsafe { SelectObject(mem_dc, HGDIOBJ(fonts.regular.0)) };
 
     let pad_x = px(ROW_PAD_X_LOGICAL, scale);
     let icon_advance = px(ICON_SIZE_LOGICAL + ICON_TEXT_GAP_LOGICAL, scale);
@@ -1121,7 +1275,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
 
     draw_text_line(
         mem_dc,
-        font_regular,
+        fonts.regular,
         "Open Audio Lock",
         RectPx {
             left: layout.open_row.left + pad_x + icon_advance,
@@ -1135,7 +1289,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
 
     draw_text_line(
         mem_dc,
-        font_regular,
+        fonts.regular,
         "Lock Active",
         RectPx {
             left: layout.lock_row.left + pad_x + icon_advance,
@@ -1149,7 +1303,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
 
     draw_text_line(
         mem_dc,
-        font_badge,
+        fonts.badge,
         badge_text,
         badge_rect,
         if snapshot.lock_enabled {
@@ -1162,7 +1316,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
 
     draw_text_line(
         mem_dc,
-        font_header,
+        fonts.header,
         "PROFILES",
         RectPx {
             left: layout.header_rect.left + pad_x,
@@ -1188,7 +1342,7 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
     if let Some(empty_rect) = layout.empty_profiles_rect {
         draw_text_line(
             mem_dc,
-            font_profile_regular,
+            fonts.profile_regular,
             "No profiles",
             RectPx {
                 left: empty_rect.left + pad_x,
@@ -1208,9 +1362,9 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
             }
             let hovered = matches!(&data.hovered, Some(HitItem::Profile(id)) if id == &row.id);
             let font = if row.active {
-                font_profile_active
+                fonts.profile_active
             } else {
-                font_profile_regular
+                fonts.profile_regular
             };
             let color = if row.active || hovered {
                 palette.text
@@ -1245,10 +1399,10 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
     }
 
     let (quit_font, quit_label, quit_text_color) = if data.confirm_quit {
-        (font_semibold, "Confirm Quit?", palette.inv_text)
+        (fonts.semibold, "Confirm Quit?", palette.inv_text)
     } else {
         (
-            font_regular,
+            fonts.regular,
             "Quit",
             if data.hovered == Some(HitItem::Quit) {
                 palette.text
@@ -1274,15 +1428,6 @@ fn paint_menu(hwnd: HWND, data: &WindowData) {
     unsafe {
         let _ = BitBlt(hdc, 0, 0, width, height, Some(mem_dc), 0, 0, SRCCOPY);
         SelectObject(mem_dc, old_font);
-        let _ = DeleteObject(HGDIOBJ(font_regular.0));
-        let _ = DeleteObject(HGDIOBJ(font_semibold.0));
-        let _ = DeleteObject(HGDIOBJ(font_profile_regular.0));
-        let _ = DeleteObject(HGDIOBJ(font_profile_active.0));
-        let _ = DeleteObject(HGDIOBJ(font_header.0));
-        let _ = DeleteObject(HGDIOBJ(font_badge.0));
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(HGDIOBJ(hbitmap.0));
-        let _ = DeleteDC(mem_dc);
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -1311,7 +1456,7 @@ fn create_ui_font(logical_px: f32, scale: f32, weight: i32) -> HFONT {
 }
 
 fn compute_badge_rect(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
+    hdc: HDC,
     font: HFONT,
     text: &str,
     row: RectPx,
@@ -1339,7 +1484,7 @@ fn compute_badge_rect(
 }
 
 fn draw_text_line(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
+    hdc: HDC,
     font: HFONT,
     text: &str,
     rect: RectPx,

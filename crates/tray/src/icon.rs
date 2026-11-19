@@ -14,19 +14,21 @@ const BASE_Y: f32 = 29.25;
 const BASE_HALF_W: f32 = 5.75;
 
 const WHITE: [f32; 3] = [255.0, 255.0, 255.0];
+const DARK: [f32; 3] = [20.0, 20.0, 20.0];
 const RED: [f32; 3] = [239.0, 68.0, 68.0];
 
-pub fn unmuted_mic_icon() -> Icon {
-    render_icon(false)
+pub fn unmuted_mic_icon(light_taskbar: bool) -> Icon {
+    render_icon(false, light_taskbar)
 }
 
-pub fn muted_mic_icon() -> Icon {
-    render_icon(true)
+pub fn muted_mic_icon(light_taskbar: bool) -> Icon {
+    render_icon(true, light_taskbar)
 }
 
-fn render_icon(muted: bool) -> Icon {
+fn render_icon(muted: bool, light_taskbar: bool) -> Icon {
     let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
     let samples_total = (SUPERSAMPLE * SUPERSAMPLE) as f32;
+    let outline_color = if light_taskbar { DARK } else { WHITE };
 
     for py in 0..ICON_SIZE {
         for px in 0..ICON_SIZE {
@@ -39,7 +41,7 @@ fn render_icon(muted: bool) -> Icon {
                 for sx in 0..SUPERSAMPLE {
                     let x = px as f32 + (sx as f32 + 0.5) / SUPERSAMPLE as f32;
                     let y = py as f32 + (sy as f32 + 0.5) / SUPERSAMPLE as f32;
-                    if let Some([r, g, b]) = sample_pixel(x, y, muted) {
+                    if let Some([r, g, b]) = sample_pixel(x, y, muted, outline_color) {
                         r_sum += r;
                         g_sum += g;
                         b_sum += b;
@@ -61,10 +63,10 @@ fn render_icon(muted: bool) -> Icon {
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).expect("32x32 RGBA icon data is always valid")
 }
 
-fn sample_pixel(x: f32, y: f32, muted: bool) -> Option<[f32; 3]> {
+fn sample_pixel(x: f32, y: f32, muted: bool, outline_color: [f32; 3]) -> Option<[f32; 3]> {
     let cap_signed = capsule_sdf(x, y);
     if mic_outline_sdf(x, y, cap_signed) <= STROKE_HALF {
-        return Some(WHITE);
+        return Some(outline_color);
     }
     if muted && cap_signed < -STROKE_HALF {
         return Some(RED);

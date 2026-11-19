@@ -20,6 +20,7 @@ use audio_lock_core::update::IDLE_RESTART_MS;
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_TIMER, WM_USER,
 };
@@ -31,10 +32,10 @@ use crate::popup_menu::{PopupAction, PopupMenu};
 use crate::updater::Updater;
 use crate::win32::{
     WM_APP_APPLY_UPDATE, WM_APP_CHECK_UPDATES, WM_APP_OPEN_FLYOUT, WM_APP_QUIT,
-    WM_APP_REFRESH_TRAY, WM_APP_TRAY_EVENT, WM_APP_UPDATE_STAGED,
+    WM_APP_REFRESH_TRAY, WM_APP_THEME_CHANGED, WM_APP_TRAY_EVENT, WM_APP_UPDATE_STAGED,
 };
 
-const POST_UPDATE_MUTEX_WAIT_MS: u64 = 3_000;
+const POST_UPDATE_MUTEX_WAIT_MS: u64 = 20_000;
 const REOPEN_DEBOUNCE: Duration = Duration::from_millis(350);
 
 enum TrayClick {
@@ -48,14 +49,24 @@ struct TrayVisualCache {
 }
 
 fn main() {
-    let is_post_update = std::env::args().any(|arg| arg == "--post-update");
-    let Some(_instance_guard) = (if is_post_update {
+    let args: Vec<String> = std::env::args().collect();
+    let is_post_update = args.iter().any(|arg| arg == "--post-update");
+    let wait_pid = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--wait-pid="))
+        .and_then(|raw| raw.parse::<u32>().ok());
+    if let Some(pid) = wait_pid {
+        win32::wait_for_pid_exit(pid, POST_UPDATE_MUTEX_WAIT_MS);
+    }
+
+    let Some(guard) = (if is_post_update {
         win32::SingleInstanceGuard::acquire_with_wait(TRAY_MUTEX_NAME, POST_UPDATE_MUTEX_WAIT_MS)
     } else {
         win32::SingleInstanceGuard::acquire(TRAY_MUTEX_NAME)
     }) else {
         return;
     };
+    let mut instance_guard = Some(guard);
 
     win32::enable_dpi_awareness();
     win32::configure_low_impact_process();
@@ -91,8 +102,9 @@ fn main() {
         }
     }));
 
-    let unmuted_icon = icon::unmuted_mic_icon();
-    let muted_icon = icon::muted_mic_icon();
+    let mut light_taskbar = win32::is_system_light_taskbar();
+    let mut unmuted_icon = icon::unmuted_mic_icon(light_taskbar);
+    let mut muted_icon = icon::muted_mic_icon(light_taskbar);
 
     let initial_state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let initial_muted = initial_state.are_active_mics_muted();
@@ -123,7 +135,6 @@ fn main() {
     let last_anchor = Arc::new(Mutex::new(initial_anchor));
     let mut tray_icon = Some(tray);
 
-    let refresh_pending = Arc::new(AtomicBool::new(false));
     let open_flyout_pending = Arc::new(AtomicBool::new(false));
     let quit_pending = Arc::new(AtomicBool::new(false));
     let check_updates_pending = Arc::new(AtomicBool::new(false));
@@ -133,26 +144,26 @@ fn main() {
         state: Arc::clone(&state),
         audio: Arc::clone(&audio),
         last_anchor: Arc::clone(&last_anchor),
-        refresh_pending: Arc::clone(&refresh_pending),
         open_flyout_pending: Arc::clone(&open_flyout_pending),
         quit_pending: Arc::clone(&quit_pending),
         check_updates_pending: Arc::clone(&check_updates_pending),
         apply_update_pending: Arc::clone(&apply_update_pending),
         wake,
     });
+    ipc::spawn_quit_event_listener(Arc::clone(&quit_pending), wake);
 
     win32::set_timer(
         msg_window.hwnd(),
         updater::TIMER_UPDATE_INITIAL,
         updater::INITIAL_CHECK_DELAY_MS,
     );
-    if updater.has_staged() {
-        win32::set_timer(
-            msg_window.hwnd(),
-            updater::TIMER_IDLE_CHECK,
-            updater::IDLE_CHECK_INTERVAL_MS,
-        );
-    }
+    let mut idle_timer_armed = false;
+    sync_idle_timer(
+        msg_window.hwnd(),
+        &updater,
+        initial_state.auto_update,
+        &mut idle_timer_armed,
+    );
     win32::trim_working_set();
 
     let mut msg = MSG::default();
@@ -179,21 +190,29 @@ fn main() {
                     updater.spawn_check(false);
                 }
                 updater::TIMER_IDLE_CHECK => {
-                    if !updater.has_staged() {
+                    let auto_update = state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .auto_update;
+                    if !updater.has_staged() || !auto_update || !updater.can_auto_apply() {
                         win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-                    } else {
-                        let auto_update = state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .auto_update;
-                        if auto_update
-                            && win32::idle_duration_ms() >= IDLE_RESTART_MS
-                            && !flyout.is_open()
-                            && !popup_menu.is_open()
-                            && updater.try_apply_staged()
-                        {
+                        idle_timer_armed = false;
+                    } else if win32::idle_duration_ms() >= IDLE_RESTART_MS
+                        && !win32::is_fullscreen_or_busy()
+                        && !flyout.is_open()
+                        && !popup_menu.is_open()
+                    {
+                        if updater.try_apply_staged(false) {
                             win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+                            idle_timer_armed = false;
                             quit_pending.store(true, Ordering::Release);
+                        } else {
+                            sync_idle_timer(
+                                msg_window.hwnd(),
+                                &updater,
+                                auto_update,
+                                &mut idle_timer_armed,
+                            );
                         }
                     }
                 }
@@ -201,16 +220,34 @@ fn main() {
             }
         }
 
-        if msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_UPDATE_STAGED {
-            if updater.has_staged() {
-                win32::set_timer(
-                    msg_window.hwnd(),
-                    updater::TIMER_IDLE_CHECK,
-                    updater::IDLE_CHECK_INTERVAL_MS,
-                );
-            } else {
-                win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+        if msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_THEME_CHANGED {
+            let current_light = win32::is_system_light_taskbar();
+            if current_light != light_taskbar {
+                light_taskbar = current_light;
+                unmuted_icon = icon::unmuted_mic_icon(light_taskbar);
+                muted_icon = icon::muted_mic_icon(light_taskbar);
+                if let Some(tray) = tray_icon.as_ref() {
+                    let icon = if tray_cache.muted {
+                        muted_icon.clone()
+                    } else {
+                        unmuted_icon.clone()
+                    };
+                    let _ = tray.set_icon(Some(icon));
+                }
             }
+        }
+
+        if msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_UPDATE_STAGED {
+            let auto_update = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .auto_update;
+            sync_idle_timer(
+                msg_window.hwnd(),
+                &updater,
+                auto_update,
+                &mut idle_timer_armed,
+            );
             if flyout.is_open() {
                 flyout.invalidate();
             }
@@ -236,11 +273,18 @@ fn main() {
         if apply_update_pending.swap(false, Ordering::AcqRel)
             || (msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_APPLY_UPDATE)
         {
-            if updater.try_apply_staged() {
+            if updater.try_apply_staged(true) {
                 win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+                idle_timer_armed = false;
                 quit_pending.store(true, Ordering::Release);
-            } else if !updater.has_staged() {
-                win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+            } else {
+                if !updater.has_staged() {
+                    win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+                    idle_timer_armed = false;
+                }
+                if flyout.is_open() {
+                    flyout.flash_status("Update failed - retry later");
+                }
             }
         }
 
@@ -253,6 +297,12 @@ fn main() {
                 }
                 PopupAction::ApplyAction(app_action) => {
                     let snapshot = audio.apply_action(app_action);
+                    sync_idle_timer(
+                        msg_window.hwnd(),
+                        &updater,
+                        snapshot.auto_update,
+                        &mut idle_timer_armed,
+                    );
                     if let Some(tray) = tray_icon.as_ref() {
                         refresh_tray(tray, &mut tray_cache, &snapshot, &unmuted_icon, &muted_icon);
                     }
@@ -275,19 +325,24 @@ fn main() {
             win32::kill_timer(msg_window.hwnd(), updater::TIMER_UPDATE_INITIAL);
             win32::kill_timer(msg_window.hwnd(), updater::TIMER_UPDATE_PERIODIC);
             win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
+            idle_timer_armed = false;
             flyout.close();
             popup_menu.close();
             audio.shutdown();
-            tray_icon.take();
+            drop(tray_icon.take());
             win32::post_quit();
             continue;
         }
 
-        if refresh_pending.swap(false, Ordering::AcqRel)
-            || (msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_REFRESH_TRAY)
-        {
+        if msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_REFRESH_TRAY {
+            let snapshot = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            sync_idle_timer(
+                msg_window.hwnd(),
+                &updater,
+                snapshot.auto_update,
+                &mut idle_timer_armed,
+            );
             if let Some(tray) = tray_icon.as_ref() {
-                let snapshot = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 refresh_tray(tray, &mut tray_cache, &snapshot, &unmuted_icon, &muted_icon);
             }
             if flyout.is_open() {
@@ -355,9 +410,24 @@ fn main() {
     }
 
     audio.shutdown();
+    flyout.close();
+    popup_menu.close();
+    drop(tray_icon.take());
     drop(flyout);
     drop(popup_menu);
-    drop(tray_icon);
+    drop(instance_guard.take());
+}
+
+fn sync_idle_timer(hwnd: HWND, updater: &Updater, auto_update: bool, armed: &mut bool) {
+    let should_arm = auto_update && updater.has_staged() && updater.can_auto_apply();
+    if should_arm != *armed {
+        if should_arm {
+            win32::set_timer(hwnd, updater::TIMER_IDLE_CHECK, updater::IDLE_CHECK_INTERVAL_MS);
+        } else {
+            win32::kill_timer(hwnd, updater::TIMER_IDLE_CHECK);
+        }
+        *armed = should_arm;
+    }
 }
 
 fn anchor_from_rect(rect: Rect) -> (i32, i32) {
@@ -398,10 +468,10 @@ fn build_tooltip(state: &AppState) -> String {
     };
     if state.lock_enabled {
         match state.active_profile() {
-            Some(profile) => format!("Audio Lock — {mic_status} · Locked ({})", profile.name),
-            None => format!("Audio Lock — {mic_status} · Locked"),
+            Some(profile) => format!("Audio Lock - {mic_status} · Locked ({})", profile.name),
+            None => format!("Audio Lock - {mic_status} · Locked"),
         }
     } else {
-        format!("Audio Lock — {mic_status} · Unlocked")
+        format!("Audio Lock - {mic_status} · Unlocked")
     }
 }

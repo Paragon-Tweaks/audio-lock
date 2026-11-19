@@ -21,7 +21,7 @@ impl Drop for RegKey {
     }
 }
 
-pub fn is_enabled() -> bool {
+fn read_run_value() -> Option<String> {
     let subkey = win32::to_wide(RUN_SUBKEY);
     let value_name = win32::to_wide(VALUE_NAME);
     let mut hkey = HKEY::default();
@@ -36,7 +36,7 @@ pub fn is_enabled() -> bool {
         )
     };
     if status != ERROR_SUCCESS {
-        return false;
+        return None;
     }
     let key = RegKey(hkey);
 
@@ -52,10 +52,59 @@ pub fn is_enabled() -> bool {
             Some(&mut byte_len),
         )
     };
+    if query != ERROR_SUCCESS
+        || (value_type != REG_SZ && value_type != REG_EXPAND_SZ)
+        || byte_len < 2
+    {
+        return None;
+    }
 
-    query == ERROR_SUCCESS
-        && (value_type == REG_SZ || value_type == REG_EXPAND_SZ)
-        && byte_len > 2
+    let mut wide = vec![0u16; (byte_len as usize).div_ceil(2)];
+    let mut read_len = (wide.len() * 2) as u32;
+    let read_status = unsafe {
+        RegQueryValueExW(
+            key.0,
+            PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(wide.as_mut_ptr().cast::<u8>()),
+            Some(&mut read_len),
+        )
+    };
+    if read_status != ERROR_SUCCESS || (value_type != REG_SZ && value_type != REG_EXPAND_SZ) {
+        return None;
+    }
+
+    let unit_len = (read_len as usize / 2).min(wide.len());
+    let end = wide[..unit_len]
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(unit_len);
+    let value = String::from_utf16_lossy(&wide[..end]);
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn current_exe_command() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("Failed to resolve executable path: {err}"))?;
+    Ok(format!("\"{}\"", exe.display()))
+}
+
+pub fn is_enabled() -> bool {
+    read_run_value().is_some()
+}
+
+pub fn sync_if_enabled() -> bool {
+    let Some(existing) = read_run_value() else {
+        return false;
+    };
+    if let Ok(expected) = current_exe_command()
+        && !existing.eq_ignore_ascii_case(&expected)
+    {
+        let _ = set_enabled(true);
+    }
+    true
 }
 
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
@@ -63,9 +112,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let value_name = win32::to_wide(VALUE_NAME);
 
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|err| format!("Failed to resolve executable path: {err}"))?;
-        let command = format!("\"{}\"", exe.display());
+        let command = current_exe_command()?;
         let data_wide = win32::to_wide(&command);
         let data_bytes = unsafe {
             std::slice::from_raw_parts(data_wide.as_ptr().cast::<u8>(), data_wide.len() * 2)

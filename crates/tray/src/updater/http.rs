@@ -10,7 +10,7 @@ use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Networking::WinHttp::{
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
     WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPEN_REQUEST_FLAGS,
-    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
     WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
     WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData,
     WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
@@ -53,9 +53,43 @@ impl Drop for WinHttpHandle {
 
 struct ParsedUrl {
     host: Vec<u16>,
+    host_str: String,
     object_name: Vec<u16>,
     port: u16,
     is_https: bool,
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+fn is_allowed_github_host(host: &str) -> bool {
+    const GH_USERCONTENT_SUFFIX: &str = ".githubusercontent.com";
+    host == "github.com"
+        || host == "objects.githubusercontent.com"
+        || host == "release-assets.githubusercontent.com"
+        || (host.ends_with(GH_USERCONTENT_SUFFIX)
+            && host.len() > GH_USERCONTENT_SUFFIX.len()
+            && !host.starts_with('.')
+            && !host.contains(".."))
+}
+
+pub fn validate_asset_url(asset_url: &str, manifest_url: &str) -> Result<(), String> {
+    let manifest = parse_url(manifest_url)?;
+    let asset = parse_url(asset_url)?;
+
+    if manifest.is_https && !asset.is_https {
+        return Err("Asset URL must use HTTPS when manifest URL uses HTTPS".to_string());
+    }
+
+    if !is_allowed_github_host(&asset.host_str) && asset.host_str != manifest.host_str {
+        return Err(format!(
+            "Asset host '{}' is not allowed for manifest host '{}'",
+            asset.host_str, manifest.host_str
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
@@ -91,6 +125,13 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
             components.dwHostNameLength as usize,
         )
     };
+    let host_str = String::from_utf16(host_slice)
+        .map_err(|_| "URL host contains invalid UTF-16".to_string())?
+        .to_ascii_lowercase();
+    if !is_https && !is_loopback_host(&host_str) {
+        return Err("Plaintext HTTP is only allowed for loopback hosts".to_string());
+    }
+
     let mut host = Vec::with_capacity(host_slice.len() + 1);
     host.extend_from_slice(host_slice);
     host.push(0);
@@ -127,6 +168,7 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
 
     Ok(ParsedUrl {
         host,
+        host_str,
         object_name,
         port: components.nPort,
         is_https,
@@ -192,7 +234,7 @@ fn open_get_request(url: &str) -> Result<OpenRequest, String> {
         "WinHttpOpenRequest",
     )?;
 
-    let redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    let redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     unsafe {
         WinHttpSetOption(
             Some(request.raw()),
@@ -361,5 +403,72 @@ mod tests {
         let content = fs::read(&dest).expect("read downloaded file");
         let _ = fs::remove_file(&dest);
         assert_eq!(content, b"update-bytes");
+    }
+
+    #[test]
+    fn rejects_plaintext_non_loopback_http() {
+        assert!(parse_url("http://example.com/manifest.json").is_err());
+        assert!(parse_url("http://github.com/owner/repo/releases/download/v1/a.zip").is_err());
+        assert!(parse_url("http://127.0.0.1:8080/manifest.json").is_ok());
+        assert!(parse_url("http://localhost:8080/manifest.json").is_ok());
+        assert!(parse_url("http://[::1]:8080/manifest.json").is_ok());
+        assert!(parse_url("https://github.com/owner/repo/releases/latest/download/manifest.json").is_ok());
+    }
+
+    #[test]
+    fn validates_asset_url_https_and_host_allowlist() {
+        let gh_manifest = "https://github.com/owner/repo/releases/latest/download/manifest.json";
+
+        assert!(validate_asset_url(
+            "https://github.com/owner/repo/releases/download/v1.0.0/app.zip",
+            gh_manifest
+        )
+        .is_ok());
+        assert!(validate_asset_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/app.zip",
+            gh_manifest
+        )
+        .is_ok());
+        assert!(validate_asset_url(
+            "https://release-assets.githubusercontent.com/app.zip",
+            gh_manifest
+        )
+        .is_ok());
+        assert!(validate_asset_url(
+            "https://cdn.githubusercontent.com/app.zip",
+            gh_manifest
+        )
+        .is_ok());
+
+        // Reject HTTPS-to-HTTP downgrade and untrusted hosts.
+        assert!(validate_asset_url(
+            "http://github.com/owner/repo/releases/download/v1.0.0/app.zip",
+            gh_manifest
+        )
+        .is_err());
+        assert!(validate_asset_url(
+            "http://127.0.0.1:8080/app.zip",
+            "https://127.0.0.1:8443/manifest.json"
+        )
+        .is_err());
+        assert!(validate_asset_url("https://evil.example.com/app.zip", gh_manifest).is_err());
+        assert!(validate_asset_url("https://evilgithubusercontent.com/app.zip", gh_manifest).is_err());
+
+        // Allow custom self-hosted HTTPS or local loopback HTTP when hosts match.
+        assert!(validate_asset_url(
+            "https://updates.example.com/v1/app.zip",
+            "https://updates.example.com/manifest.json"
+        )
+        .is_ok());
+        assert!(validate_asset_url(
+            "https://other.example.com/v1/app.zip",
+            "https://updates.example.com/manifest.json"
+        )
+        .is_err());
+        assert!(validate_asset_url(
+            "http://127.0.0.1:8080/app.zip",
+            "http://127.0.0.1:8080/manifest.json"
+        )
+        .is_ok());
     }
 }
