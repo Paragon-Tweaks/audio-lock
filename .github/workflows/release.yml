@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.2.0). Defaults to Cargo.toml version if omitted."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Windows Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $ver = "${{ github.ref_name }}".TrimStart("v", "V")
+          } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.version }}")) {
+            $ver = "${{ inputs.version }}".Trim().TrimStart("v", "V")
+          } else {
+            $cargo = Get-Content -Path "Cargo.toml" -Raw
+            if ($cargo -match '(?ms)^\[workspace\.package\].*?^\s*version\s*=\s*"([^"]+)"') {
+              $ver = $Matches[1]
+            } else {
+              throw "Could not read version from Cargo.toml"
+            }
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        env:
+          AUDIO_LOCK_GITHUB_REPO: ${{ github.repository }}
+        run: cargo build --release --workspace
+
+      # Optional Authenticode signing for the application binary before zipping & installer packaging.
+      # Set repository variable ENABLE_CODE_SIGNING=true and configure certificate secrets (or Azure Trusted Signing).
+      - name: Sign application binary (optional)
+        if: ${{ vars.ENABLE_CODE_SIGNING == 'true' }}
+        shell: pwsh
+        run: |
+          # Example using signtool.exe with an imported PFX certificate:
+          # signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+          #   target\release\default-audio-lock.exe
+          # Or use azure/trusted-signing-action@v0 against target\release\default-audio-lock.exe
+          Write-Host "Code signing step enabled; plug in signtool or Azure Trusted Signing here."
+
+      - name: Package update zip, installer, and manifest
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+
+          $trayExe = "target\release\default-audio-lock.exe"
+          $updateZip = "dist\default-audio-lock-win64-update.zip"
+          Compress-Archive -Path $trayExe -DestinationPath $updateZip -Force
+
+          $isccCmd = Get-Command "iscc.exe" -ErrorAction SilentlyContinue
+          $iscc = if ($isccCmd) { $isccCmd.Source } else { "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "Inno Setup 6 (iscc.exe) not found."
+          }
+          & $iscc "/DAppVersion=$version" "installer\default-audio-lock.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "iscc failed with exit code $LASTEXITCODE"
+          }
+
+          $sha256 = (Get-FileHash -Path $updateZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $publishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $assetUrl = "https://github.com/${{ github.repository }}/releases/download/v$version/default-audio-lock-win64-update.zip"
+
+          $manifest = [ordered]@{
+            version      = $version
+            published_at = $publishedAt
+            sha256       = $sha256
+            asset_url    = $assetUrl
+          } | ConvertTo-Json -Depth 2
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "dist\manifest.json"), $manifest + "`n", [System.Text.UTF8Encoding]::new($false))
+
+      # Optional Authenticode signing for the generated setup executable.
+      - name: Sign setup installer (optional)
+        if: ${{ vars.ENABLE_CODE_SIGNING == 'true' }}
+        shell: pwsh
+        run: |
+          # Example using signtool.exe:
+          # signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
+          #   "dist\DefaultAudioLock-Setup-${{ steps.version.outputs.version }}.exe"
+          Write-Host "Installer code signing step enabled; plug in signtool or Azure Trusted Signing here."
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/DefaultAudioLock-Setup-*.exe
+            dist/default-audio-lock-win64-update.zip
+            dist/manifest.json
