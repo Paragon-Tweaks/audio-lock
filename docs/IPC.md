@@ -83,7 +83,8 @@ Every valid connection receives one `\n`-terminated JSON value:
            "enhancements": {
              "sys_fx_enabled": false,
              "advanced_enabled": false,
-             "spatial_sound_enabled": false
+             "spatial_sound_enabled": false,
+             "previous_spatial_format": null
            },
            "previous_enhancements": null,
            "listen": null

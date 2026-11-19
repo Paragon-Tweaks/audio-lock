@@ -296,6 +296,9 @@ impl AppState {
                 has_real_devices,
             ),
         };
+        if !self.separate_comms_role {
+            self.unify_comms_roles();
+        }
 
         if has_real_devices
             && !self.profiles.is_empty()
@@ -349,6 +352,17 @@ impl AppState {
         true
     }
 
+    pub fn clear_previous_spatial_format(&mut self, device_id: &str) -> bool {
+        let Some(device) = self.device_mut(device_id) else {
+            return false;
+        };
+        if device.enhancements.previous_spatial_format.is_none() {
+            return false;
+        }
+        device.enhancements.previous_spatial_format = None;
+        true
+    }
+
     pub fn set_device_listen(&mut self, device_id: &str, listen: ListenConfig) -> bool {
         let Some(device) = self.device_mut(device_id) else {
             return false;
@@ -397,7 +411,7 @@ impl AppState {
     }
 
     pub fn set_comms(&mut self, flow: DeviceFlow, device_id: &str) {
-        if !self.has_device_with_flow(flow, device_id) {
+        if !self.separate_comms_role || !self.has_device_with_flow(flow, device_id) {
             return;
         }
         match flow {
@@ -603,6 +617,9 @@ impl AppState {
 
     pub fn reenable_all_enhancements(&mut self) {
         for device in &mut self.devices {
+            if device.disabled {
+                continue;
+            }
             reenable_enhancements_from_undo(device);
         }
     }
@@ -686,9 +703,7 @@ impl AppState {
                 device.muted = snapshot.muted;
                 let saved_spatial = device.enhancements.previous_spatial_format.clone();
                 device.enhancements = snapshot.enhancements;
-                if !device.enhancements.spatial_sound_enabled
-                    && device.enhancements.previous_spatial_format.is_none()
-                {
+                if device.enhancements.previous_spatial_format.is_none() {
                     device.enhancements.previous_spatial_format = saved_spatial;
                 }
                 if device.flow == DeviceFlow::Input {

@@ -510,6 +510,7 @@ fn live_device(id: &str, name: &str, flow: DeviceFlow) -> AudioDevice {
 #[test]
 fn reconcile_live_devices_preserves_metadata_and_migrates_mock_profiles() {
     let mut state = default_mock_state();
+    state.separate_comms_role = true;
     assert!(!state.profiles.is_empty());
     assert_eq!(state.active_profile_id.as_deref(), Some("gaming"));
 
@@ -1515,4 +1516,131 @@ fn previous_spatial_format_defaults_round_trips_reconciles_and_clears_on_undo() 
     let restored_all = round_tripped.device(out_id).unwrap();
     assert!(restored_all.enhancements.spatial_sound_enabled);
     assert_eq!(restored_all.enhancements.previous_spatial_format, None);
+}
+
+#[test]
+fn unified_comms_mode_reconciles_split_roles_and_ignores_set_comms() {
+    let out_1 = "{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}";
+    let out_2 = "{0.0.0.00000000}.{22222222-2222-2222-2222-222222222222}";
+    let in_1 = "{0.0.1.00000000}.{33333333-3333-3333-3333-333333333333}";
+    let in_2 = "{0.0.1.00000000}.{44444444-4444-4444-4444-444444444444}";
+
+    let mut state = AppState::default();
+    assert!(!state.separate_comms_role);
+
+    // Windows starting with split Default/Comms roles must unify comms_*_id to default_*_id.
+    state.reconcile_live_devices(
+        vec![
+            live_device(out_1, "Headphones", DeviceFlow::Output),
+            live_device(out_2, "Speakers", DeviceFlow::Output),
+            live_device(in_1, "USB Mic", DeviceFlow::Input),
+            live_device(in_2, "Headset Mic", DeviceFlow::Input),
+        ],
+        RoleAssignments {
+            default_output_id: out_1.into(),
+            comms_output_id: out_2.into(),
+            default_input_id: in_1.into(),
+            comms_input_id: in_2.into(),
+        },
+    );
+
+    assert_eq!(state.roles.default_output_id, out_1);
+    assert_eq!(state.roles.comms_output_id, out_1);
+    assert_eq!(state.roles.default_input_id, in_1);
+    assert_eq!(state.roles.comms_input_id, in_1);
+
+    // `set_comms` and `AppAction::SetComms` are ignored in unified mode and do not re-enable
+    // or desync roles.
+    assert!(state.set_device_disabled(out_2, true));
+    state.set_comms(DeviceFlow::Output, out_2);
+    state.apply_action(&AppAction::SetComms {
+        flow: DeviceFlow::Output,
+        device_id: out_2.into(),
+    });
+    state.apply_action(&AppAction::SetComms {
+        flow: DeviceFlow::Input,
+        device_id: in_2.into(),
+    });
+    assert_eq!(state.roles.comms_output_id, out_1);
+    assert_eq!(state.roles.comms_input_id, in_1);
+    assert!(state.device(out_2).unwrap().disabled);
+}
+
+#[test]
+fn reenable_all_enhancements_skips_disabled_devices_and_profile_preserves_spatial_undo() {
+    let dolby_guid = "{b53d940c-0102-4033-832d-19a81242006d}";
+    let sonic_guid = "{b53d940c-0102-4033-832d-19a81242006e}";
+
+    let out_active = "{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}";
+    let out_disabled = "{0.0.0.00000000}.{22222222-2222-2222-2222-222222222222}";
+
+    let mut active_dev = live_device(out_active, "Active Headphones", DeviceFlow::Output);
+    active_dev.enhancements.spatial_sound_enabled = true;
+    let mut disabled_dev = live_device(out_disabled, "Disabled Speakers", DeviceFlow::Output);
+    disabled_dev.enhancements.spatial_sound_enabled = true;
+
+    let mut state = AppState {
+        devices: vec![active_dev, disabled_dev],
+        roles: RoleAssignments {
+            default_output_id: out_active.into(),
+            comms_output_id: out_active.into(),
+            ..RoleAssignments::default()
+        },
+        ..AppState::default()
+    };
+
+    // Save profile while Spatial Sound is enabled (profile snapshot has previous_spatial_format: None).
+    let spatial_profile_id = state.save_current_as_profile("Spatial On");
+
+    // Disable enhancements on both devices and record their prior spatial formats.
+    state.set_auto_disable_enhancements(true);
+    assert!(state.record_previous_spatial_format(out_active, dolby_guid.into()));
+    assert!(state.record_previous_spatial_format(out_disabled, sonic_guid.into()));
+    assert!(state.set_device_disabled(out_disabled, true));
+
+    // `reenable_all_enhancements` restores active devices and leaves disabled devices' undo state intact.
+    state.set_auto_disable_enhancements(false);
+    state.reenable_all_enhancements();
+
+    let active_after = state.device(out_active).unwrap();
+    assert!(active_after.enhancements.sys_fx_enabled);
+    assert!(active_after.enhancements.spatial_sound_enabled);
+    assert_eq!(active_after.enhancements.previous_spatial_format, None);
+    assert_eq!(active_after.previous_enhancements, None);
+
+    let disabled_after = state.device(out_disabled).unwrap();
+    assert!(disabled_after.disabled);
+    assert!(!disabled_after.enhancements.any_enabled());
+    assert!(disabled_after.previous_enhancements.is_some());
+    assert_eq!(
+        disabled_after
+            .enhancements
+            .previous_spatial_format
+            .as_deref(),
+        Some(sonic_guid)
+    );
+
+    // Re-disable active device, record its spatial format, then apply the saved profile
+    // whose snapshot has `spatial_sound_enabled: true` and `previous_spatial_format: None`.
+    // `apply_profile` must preserve `previous_spatial_format` so audio/mod.rs can restore it.
+    state.set_enhancements_disabled(out_active, true);
+    assert!(state.record_previous_spatial_format(out_active, dolby_guid.into()));
+    assert!(state.apply_profile(&spatial_profile_id));
+
+    let after_profile = state.device(out_active).unwrap();
+    assert!(after_profile.enhancements.spatial_sound_enabled);
+    assert_eq!(
+        after_profile.enhancements.previous_spatial_format.as_deref(),
+        Some(dolby_guid)
+    );
+    assert!(state.clear_previous_spatial_format(out_active));
+    assert!(!state.clear_previous_spatial_format(out_active));
+    assert_eq!(
+        state
+            .device(out_active)
+            .unwrap()
+            .enhancements
+            .previous_spatial_format,
+        None
+    );
 }

@@ -7,9 +7,9 @@
 [![Latest Release](https://img.shields.io/github/v/release/Paragon-Tweaks/audio-lock?style=flat-square&color=1f1f1f&labelColor=111111&label=Release)](https://github.com/Paragon-Tweaks/audio-lock/releases/latest)
 [![License](https://img.shields.io/badge/License-GPLv3-1f1f1f?style=flat-square&labelColor=111111)](LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-1f1f1f?style=flat-square&labelColor=111111)
-![Binary Size](https://img.shields.io/badge/Binary%20Size-1.48%20MB-1f1f1f?style=flat-square&labelColor=111111)
+![Binary Size](https://img.shields.io/badge/Binary%20Size-1.49%20MB-1f1f1f?style=flat-square&labelColor=111111)
 
-Keep your Windows speakers and microphone locked where you want them, mute your mic from the taskbar, turn off hidden Windows sound effects, and hot-swap audio profiles in a single ~1.48 MB app that uses 0% CPU while you play.
+Keep your Windows speakers and microphone locked where you want them, mute your mic from the taskbar, turn off hidden Windows sound effects, and hot-swap audio profiles in a single ~1.49 MB app that uses 0% CPU while you play.
 
 **[Download Latest Release (`DefaultAudioLock-Setup-<version>.exe`)](https://github.com/Paragon-Tweaks/audio-lock/releases/latest)**
 
@@ -66,7 +66,7 @@ Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights
 
 | Metric | Measured Result |
 | :--- | :--- |
-| **Single Executable** | `1.48 MB` (`1,550,848` bytes) |
+| **Single Executable** | `1.49 MB` (`1,559,040` bytes) |
 | **Idle RAM** | `1.23 MB` Working Set (`2.14 MB` Private) |
 | **Idle CPU** | `0.000%` (zero polling, pure Win32 message loop + CoreAudio COM callbacks) |
 | **Flyout Open** | `6.88 MB` Working Set (`2.49 MB` Private), `~23 ms` open, `0 MB` GPU/VRAM (no D3D11/DXGI loaded) |

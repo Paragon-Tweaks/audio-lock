@@ -94,7 +94,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($Version)) {
         $Version = $CargoVersion
     } else {
-        $Version = $Version.Trim().TrimStart('v', 'V')
+        $Version = $Version.Trim() -replace '^[vV]', ''
         if ($Version -ne $CargoVersion) {
             throw "Version mismatch: -Version '$Version' does not match Cargo.toml [workspace.package].version '$CargoVersion'."
         }
@@ -106,11 +106,17 @@ try {
         -RepoEnv $prevGithubRepo `
         -ManifestUrlParam $ManifestUrl
 
-    if ($PSBoundParameters.ContainsKey("GithubRepo")) {
-        $env:AUDIO_LOCK_GITHUB_REPO = $GithubRepo
+    $hasGithubRepo = $PSBoundParameters.ContainsKey("GithubRepo") -and -not [string]::IsNullOrWhiteSpace($GithubRepo)
+    $hasManifestUrl = $PSBoundParameters.ContainsKey("ManifestUrl") -and -not [string]::IsNullOrWhiteSpace($ManifestUrl)
+
+    if ($hasGithubRepo) {
+        $env:AUDIO_LOCK_GITHUB_REPO = $GithubRepo.Trim().Trim('/')
+        if (-not $hasManifestUrl) {
+            Remove-Item Env:AUDIO_LOCK_UPDATE_MANIFEST_URL -ErrorAction SilentlyContinue
+        }
     }
-    if ($PSBoundParameters.ContainsKey("ManifestUrl")) {
-        $env:AUDIO_LOCK_UPDATE_MANIFEST_URL = $ManifestUrl
+    if ($hasManifestUrl) {
+        $env:AUDIO_LOCK_UPDATE_MANIFEST_URL = $ManifestUrl.Trim()
     }
 
     Write-Host "Building release workspace for version $Version..."

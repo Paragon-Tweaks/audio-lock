@@ -1246,9 +1246,10 @@ fn compute_config_overlay(
         Some("Restart automatically after 5 min idle"),
     ));
     if let Some(ref ver) = input.state.staged_update_version {
+        let clean_ver = ver.trim_start_matches(['v', 'V']);
         specs.push(Spec::Button {
             action: HitAction::ConfigApplyStagedUpdate,
-            label: format!("Restart to update (v{ver})"),
+            label: format!("Restart to update (v{clean_ver})"),
             inverted: true,
             height: px(26.0 + 4.0, s),
         });

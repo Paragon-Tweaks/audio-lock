@@ -129,11 +129,8 @@ pub fn disable_spatial(mmdevice_id: &str) -> Option<String> {
         return None;
     }
 
-    let prev = active_spatial_format_from_config(&config);
-    if prev.is_some() {
-        let _ = set_spatial_format_on_config(&config, NONE_SPATIAL_FORMAT);
-    }
-    prev
+    let prev = active_spatial_format_from_config(&config)?;
+    set_spatial_format_on_config(&config, NONE_SPATIAL_FORMAT).then_some(prev)
 }
 
 #[cfg(test)]

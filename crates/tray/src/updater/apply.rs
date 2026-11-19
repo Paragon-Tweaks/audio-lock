@@ -34,14 +34,23 @@ pub fn has_staged_binaries(dir: &Path) -> bool {
 }
 
 pub fn verify_staged_binary(staged_dir: &Path) -> Result<PathBuf, String> {
-    let staged_tray = staged_dir.join(TRAY_EXE_NAME);
-    if !is_non_empty_file(&staged_tray) {
-        return Err("Staged update binary is missing".to_string());
+    if !has_staged_binaries(staged_dir) {
+        return Err("Staged update binary or hash marker is missing".to_string());
     }
+    let staged_tray = staged_dir.join(TRAY_EXE_NAME);
     let expected_hex = fs::read_to_string(staged_dir.join(STAGING_SHA256_FILE))
         .map_err(|err| format!("Failed to read staging hash marker: {err}"))?;
     verify::verify_sha256(&staged_tray, &expected_hex)?;
     Ok(staged_tray)
+}
+
+pub fn verify_or_purge_staged_dir(staged_dir: &Path) -> bool {
+    if verify_staged_binary(staged_dir).is_ok() {
+        true
+    } else {
+        let _ = fs::remove_dir_all(staged_dir);
+        false
+    }
 }
 
 pub fn cleanup_old_binaries() {
@@ -90,7 +99,11 @@ pub fn cleanup_old_binaries() {
 }
 
 pub fn find_existing_staged_update() -> Option<(String, PathBuf)> {
-    let entries = fs::read_dir(staging_root_dir()).ok()?;
+    find_existing_staged_update_in(&staging_root_dir())
+}
+
+fn find_existing_staged_update_in(staging_root: &Path) -> Option<(String, PathBuf)> {
+    let entries = fs::read_dir(staging_root).ok()?;
     let mut best: Option<(String, PathBuf)> = None;
 
     for entry in entries.flatten() {
@@ -104,7 +117,10 @@ pub fn find_existing_staged_update() -> Option<(String, PathBuf)> {
         if !is_valid_version_dir_name(&name) {
             continue;
         }
-        if !is_newer_version(CURRENT_VERSION, &name) || !has_staged_binaries(&path) {
+        if !is_newer_version(CURRENT_VERSION, &name) {
+            continue;
+        }
+        if !verify_or_purge_staged_dir(&path) {
             continue;
         }
         if best
@@ -454,5 +470,40 @@ mod tests {
         assert!(validate_version_dir_name("../1.2.3").is_err());
         assert!(validate_version_dir_name("1.2.3/../../x").is_err());
         assert!(validate_version_dir_name("1.2.3").is_ok());
+    }
+
+    #[test]
+    fn purges_corrupted_staged_directories_on_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "audio-lock-purge-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let valid_dir = root.join("999.1.0");
+        fs::create_dir_all(&valid_dir).expect("create valid staging dir");
+        let valid_exe = valid_dir.join(TRAY_EXE_NAME);
+        fs::write(&valid_exe, b"valid-tray-bin").expect("write valid binary");
+        let valid_hash = verify::sha256_file_hex(&valid_exe).expect("hash valid binary");
+        fs::write(valid_dir.join(STAGING_SHA256_FILE), valid_hash).expect("write valid hash");
+
+        let tampered_dir = root.join("999.2.0");
+        fs::create_dir_all(&tampered_dir).expect("create tampered staging dir");
+        fs::write(tampered_dir.join(TRAY_EXE_NAME), b"tampered-tray-bin")
+            .expect("write tampered binary");
+        fs::write(tampered_dir.join(STAGING_SHA256_FILE), "0".repeat(64))
+            .expect("write mismatched hash");
+
+        let found = find_existing_staged_update_in(&root);
+        assert_eq!(found, Some(("999.1.0".to_string(), valid_dir.clone())));
+        assert!(!tampered_dir.exists());
+        assert!(valid_dir.exists());
+
+        fs::write(&valid_exe, b"corrupted-after-staging").expect("corrupt valid binary");
+        assert!(!verify_or_purge_staged_dir(&valid_dir));
+        assert!(!valid_dir.exists());
+        assert!(find_existing_staged_update_in(&root).is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

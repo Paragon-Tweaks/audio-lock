@@ -38,9 +38,9 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           if ($env:REF_TYPE -eq "tag") {
-            $ver = $env:REF_NAME.TrimStart("v", "V")
+            $ver = $env:REF_NAME -replace '^[vV]', ''
           } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
-            $ver = $env:INPUT_VERSION.Trim().TrimStart("v", "V")
+            $ver = $env:INPUT_VERSION.Trim() -replace '^[vV]', ''
           } else {
             $cargo = Get-Content -Path "Cargo.toml" -Raw
             if ($cargo -match '(?ms)^\[workspace\.package\]\s*\r?\n(.*?)(?=^\[|\z)' -and $Matches[1] -match '(?m)^\s*version\s*=\s*"([^"]+)"') {

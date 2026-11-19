@@ -1182,18 +1182,15 @@ impl AudioWorker {
             if flow != DeviceFlow::Input {
                 return;
             }
-            let mut live_listen = self.read_listen(&device_id);
+            let live_listen = self.read_listen(&device_id);
             let updated = {
                 let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(existing) = guard.device(&device_id).and_then(|d| d.listen.as_ref())
-                    && existing.target_device_id.as_deref() == Some(LISTEN_TARGET_COMMS_OUTPUT)
-                    && live_listen.enabled
-                    && live_listen.target_device_id.as_deref()
-                        == Some(guard.roles.comms_output_id.as_str())
-                {
-                    live_listen.target_device_id = Some(LISTEN_TARGET_COMMS_OUTPUT.to_string());
-                }
-                guard.set_device_listen(&device_id, live_listen)
+                let reconciled = reconcile_live_listen(
+                    guard.device(&device_id).and_then(|d| d.listen.as_ref()),
+                    live_listen,
+                    &guard.roles.comms_output_id,
+                );
+                guard.set_device_listen(&device_id, reconciled)
             };
             if updated {
                 self.schedule_save();
@@ -1373,7 +1370,7 @@ impl AudioWorker {
                 }
             }
             AppAction::SetComms { flow, device_id } => {
-                if snapshot.has_device_with_flow(flow, &device_id) {
+                if snapshot.separate_comms_role && snapshot.has_device_with_flow(flow, &device_id) {
                     let was_disabled =
                         self.device_state(&device_id) != Some(DEVICE_STATE_ACTIVE);
                     if was_disabled || snapshot.auto_disable_unused_devices {
@@ -1452,7 +1449,9 @@ impl AudioWorker {
             }
             AppAction::ReenableAllEnhancements => {
                 for dev in &snapshot.devices {
-                    if dev.enhancements.sys_fx_enabled || dev.enhancements.advanced_enabled {
+                    if !dev.disabled
+                        && (dev.enhancements.sys_fx_enabled || dev.enhancements.advanced_enabled)
+                    {
                         self.enable_device_sysfx(&dev.id);
                     }
                 }
@@ -1823,11 +1822,21 @@ impl AudioWorker {
                 } else {
                     self.disable_device_sysfx(&device.id);
                 }
-                if active
-                    && device.flow == DeviceFlow::Output
-                    && !device.enhancements.spatial_sound_enabled
-                {
-                    self.disable_device_spatial(&device.id);
+                if active && device.flow == DeviceFlow::Output {
+                    if device.enhancements.spatial_sound_enabled {
+                        if !device.disabled
+                            && let Some(fmt) = device.enhancements.previous_spatial_format.as_deref()
+                            && spatial::set_spatial_format(&device.id, fmt)
+                        {
+                            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if guard.clear_previous_spatial_format(&device.id) {
+                                self.save_due = None;
+                                let _ = store::save_state(&guard);
+                            }
+                        }
+                    } else {
+                        self.disable_device_spatial(&device.id);
+                    }
                 }
             }
 
@@ -2042,6 +2051,36 @@ fn read_endpoint_volume(endpoint: &IAudioEndpointVolume) -> Option<(u8, bool)> {
     let muted = unsafe { endpoint.GetMute().ok()?.as_bool() };
     let vol_pct = (scalar.clamp(0.0, 1.0) * 100.0).round() as u8;
     Some((vol_pct, muted))
+}
+
+fn reconcile_live_listen(
+    existing: Option<&ListenConfig>,
+    mut live: ListenConfig,
+    comms_output_id: &str,
+) -> ListenConfig {
+    if let Some(existing_listen) = existing {
+        if live.enabled {
+            if existing_listen.target_device_id.as_deref() == Some(LISTEN_TARGET_COMMS_OUTPUT)
+                && !comms_output_id.is_empty()
+                && live.target_device_id.as_deref() == Some(comms_output_id)
+            {
+                live.target_device_id = Some(LISTEN_TARGET_COMMS_OUTPUT.to_string());
+            } else if existing_listen.target_device_id.as_deref()
+                == Some(LISTEN_TARGET_DEFAULT_OUTPUT)
+                && live.target_device_id.is_none()
+            {
+                live.target_device_id = Some(LISTEN_TARGET_DEFAULT_OUTPUT.to_string());
+            }
+        } else if matches!(
+            existing_listen.target_device_id.as_deref(),
+            Some(LISTEN_TARGET_DEFAULT_OUTPUT | LISTEN_TARGET_COMMS_OUTPUT)
+        ) {
+            live.target_device_id = existing_listen.target_device_id.clone();
+        } else if existing_listen.enabled && existing_listen.target_device_id.is_none() {
+            live.target_device_id = None;
+        }
+    }
+    live
 }
 
 fn desired_effective_listen<'a>(
@@ -2476,5 +2515,104 @@ mod tests {
         state.roles.comms_output_id = "out-hd660s2".into();
         state.roles.comms_input_id = String::new();
         assert_eq!(locked_role_ids(&state), vec!["out-hd660s2", "in-mv7"]);
+    }
+
+    #[test]
+    fn reconcile_live_listen_preserves_sentinels_and_allows_live_overrides() {
+        let comms_id = "{0.0.0.00000000}.{22222222-2222-2222-2222-222222222222}";
+        let other_id = "{0.0.0.00000000}.{33333333-3333-3333-3333-333333333333}";
+
+        // 1. Unchecking Listen while targeting __default_output__ keeps __default_output__.
+        let existing_default = ListenConfig {
+            enabled: true,
+            target_device_id: Some(LISTEN_TARGET_DEFAULT_OUTPUT.into()),
+        };
+        assert_eq!(
+            reconcile_live_listen(
+                Some(&existing_default),
+                ListenConfig {
+                    enabled: false,
+                    target_device_id: None,
+                },
+                comms_id,
+            ),
+            ListenConfig {
+                enabled: false,
+                target_device_id: Some(LISTEN_TARGET_DEFAULT_OUTPUT.into()),
+            }
+        );
+
+        // 2. Selecting __comms_output__ while Listen is unchecked keeps __comms_output__
+        //    even when Windows reports the resolved concrete GUID.
+        let existing_comms_off = ListenConfig {
+            enabled: false,
+            target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+        };
+        assert_eq!(
+            reconcile_live_listen(
+                Some(&existing_comms_off),
+                ListenConfig {
+                    enabled: false,
+                    target_device_id: Some(comms_id.into()),
+                },
+                comms_id,
+            ),
+            ListenConfig {
+                enabled: false,
+                target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+            }
+        );
+
+        // 3. Enabled Listen targeting __comms_output__ keeps sentinel when live matches comms_id.
+        let existing_comms_on = ListenConfig {
+            enabled: true,
+            target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+        };
+        assert_eq!(
+            reconcile_live_listen(
+                Some(&existing_comms_on),
+                ListenConfig {
+                    enabled: true,
+                    target_device_id: Some(comms_id.into()),
+                },
+                comms_id,
+            ),
+            ListenConfig {
+                enabled: true,
+                target_device_id: Some(LISTEN_TARGET_COMMS_OUTPUT.into()),
+            }
+        );
+
+        // 4. Enabled Listen retargeted in Windows to another speaker updates to concrete GUID.
+        assert_eq!(
+            reconcile_live_listen(
+                Some(&existing_comms_on),
+                ListenConfig {
+                    enabled: true,
+                    target_device_id: Some(other_id.into()),
+                },
+                comms_id,
+            ),
+            ListenConfig {
+                enabled: true,
+                target_device_id: Some(other_id.into()),
+            }
+        );
+
+        // Enabled Listen targeting __default_output__ keeps sentinel when live target is None.
+        assert_eq!(
+            reconcile_live_listen(
+                Some(&existing_default),
+                ListenConfig {
+                    enabled: true,
+                    target_device_id: None,
+                },
+                comms_id,
+            ),
+            ListenConfig {
+                enabled: true,
+                target_device_id: Some(LISTEN_TARGET_DEFAULT_OUTPUT.into()),
+            }
+        );
     }
 }

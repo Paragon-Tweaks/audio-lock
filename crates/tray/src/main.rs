@@ -158,11 +158,13 @@ fn main() {
         updater::INITIAL_CHECK_DELAY_MS,
     );
     let mut idle_timer_armed = false;
+    let mut idle_tracker = win32::ControllerIdleTracker::new();
     sync_idle_timer(
         msg_window.hwnd(),
         &updater,
         initial_state.auto_update,
         &mut idle_timer_armed,
+        &mut idle_tracker,
     );
     win32::trim_working_set();
 
@@ -195,16 +197,22 @@ fn main() {
                         .unwrap_or_else(|e| e.into_inner())
                         .auto_update;
                     if !updater.has_staged() || !auto_update || !updater.can_auto_apply() {
-                        win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-                        idle_timer_armed = false;
-                    } else if win32::idle_duration_ms() >= IDLE_RESTART_MS
+                        disarm_idle_timer(
+                            msg_window.hwnd(),
+                            &mut idle_timer_armed,
+                            &mut idle_tracker,
+                        );
+                    } else if idle_tracker.sample_and_idle_ms() >= IDLE_RESTART_MS
                         && !win32::is_fullscreen_or_busy()
                         && !flyout.is_open()
                         && !popup_menu.is_open()
                     {
                         if updater.try_apply_staged(false) {
-                            win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-                            idle_timer_armed = false;
+                            disarm_idle_timer(
+                                msg_window.hwnd(),
+                                &mut idle_timer_armed,
+                                &mut idle_tracker,
+                            );
                             quit_pending.store(true, Ordering::Release);
                         } else {
                             sync_idle_timer(
@@ -212,6 +220,7 @@ fn main() {
                                 &updater,
                                 auto_update,
                                 &mut idle_timer_armed,
+                                &mut idle_tracker,
                             );
                         }
                     }
@@ -247,6 +256,7 @@ fn main() {
                 &updater,
                 auto_update,
                 &mut idle_timer_armed,
+                &mut idle_tracker,
             );
             if flyout.is_open() {
                 flyout.invalidate();
@@ -274,13 +284,11 @@ fn main() {
             || (msg.hwnd == msg_window.hwnd() && msg.message == WM_APP_APPLY_UPDATE)
         {
             if updater.try_apply_staged(true) {
-                win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-                idle_timer_armed = false;
+                disarm_idle_timer(msg_window.hwnd(), &mut idle_timer_armed, &mut idle_tracker);
                 quit_pending.store(true, Ordering::Release);
             } else {
                 if !updater.has_staged() {
-                    win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-                    idle_timer_armed = false;
+                    disarm_idle_timer(msg_window.hwnd(), &mut idle_timer_armed, &mut idle_tracker);
                 }
                 if flyout.is_open() {
                     flyout.flash_status("Update failed - retry later");
@@ -302,6 +310,7 @@ fn main() {
                         &updater,
                         snapshot.auto_update,
                         &mut idle_timer_armed,
+                        &mut idle_tracker,
                     );
                     if let Some(tray) = tray_icon.as_ref() {
                         refresh_tray(tray, &mut tray_cache, &snapshot, &unmuted_icon, &muted_icon);
@@ -324,8 +333,7 @@ fn main() {
         {
             win32::kill_timer(msg_window.hwnd(), updater::TIMER_UPDATE_INITIAL);
             win32::kill_timer(msg_window.hwnd(), updater::TIMER_UPDATE_PERIODIC);
-            win32::kill_timer(msg_window.hwnd(), updater::TIMER_IDLE_CHECK);
-            idle_timer_armed = false;
+            disarm_idle_timer(msg_window.hwnd(), &mut idle_timer_armed, &mut idle_tracker);
             flyout.close();
             popup_menu.close();
             audio.shutdown();
@@ -341,6 +349,7 @@ fn main() {
                 &updater,
                 snapshot.auto_update,
                 &mut idle_timer_armed,
+                &mut idle_tracker,
             );
             if let Some(tray) = tray_icon.as_ref() {
                 refresh_tray(tray, &mut tray_cache, &snapshot, &unmuted_icon, &muted_icon);
@@ -418,15 +427,31 @@ fn main() {
     drop(instance_guard.take());
 }
 
-fn sync_idle_timer(hwnd: HWND, updater: &Updater, auto_update: bool, armed: &mut bool) {
+fn disarm_idle_timer(
+    hwnd: HWND,
+    armed: &mut bool,
+    idle_tracker: &mut win32::ControllerIdleTracker,
+) {
+    win32::kill_timer(hwnd, updater::TIMER_IDLE_CHECK);
+    *armed = false;
+    idle_tracker.reset();
+}
+
+fn sync_idle_timer(
+    hwnd: HWND,
+    updater: &Updater,
+    auto_update: bool,
+    armed: &mut bool,
+    idle_tracker: &mut win32::ControllerIdleTracker,
+) {
     let should_arm = auto_update && updater.has_staged() && updater.can_auto_apply();
     if should_arm != *armed {
         if should_arm {
             win32::set_timer(hwnd, updater::TIMER_IDLE_CHECK, updater::IDLE_CHECK_INTERVAL_MS);
+            *armed = true;
         } else {
-            win32::kill_timer(hwnd, updater::TIMER_IDLE_CHECK);
+            disarm_idle_timer(hwnd, armed, idle_tracker);
         }
-        *armed = should_arm;
     }
 }
 

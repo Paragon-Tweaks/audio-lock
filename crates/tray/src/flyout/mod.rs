@@ -730,15 +730,13 @@ impl WindowData {
     }
 
     fn commit_save_profile(&mut self, hwnd: HWND) {
-        let raw_name = self.profile_name_input.clone();
+        let raw_name = std::mem::take(&mut self.profile_name_input);
         self.saving_profile = false;
-        self.profile_name_input.clear();
         self.active_input = ActiveInput::None;
         self.input_selected_all = false;
-        self.shared
-            .audio
-            .apply_action_async(AppAction::SaveProfile { name: raw_name.clone() });
-        let snapshot = self.snapshot();
+        let snapshot = self.shared.audio.apply_action(AppAction::SaveProfile {
+            name: raw_name.clone(),
+        });
         let saved_name = snapshot
             .active_profile()
             .map(|p| p.name.clone())
@@ -4350,6 +4348,57 @@ mod tests {
         // Disabled and unknown devices are ignored by in-place drag updates.
         assert!(layout.update_card_volume("out-2", 60, false).is_none());
         assert!(layout.update_card_volume("missing", 50, false).is_none());
+
+        unsafe {
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn staged_update_button_trims_leading_v_prefix() {
+        let dc = unsafe { CreateCompatibleDC(None) };
+        let fonts = FontCache::new(1.0);
+
+        for (raw, expected) in [
+            ("1.2.3", "Restart to update (v1.2.3)"),
+            ("v0.2.0", "Restart to update (v0.2.0)"),
+            ("V0.2.0", "Restart to update (v0.2.0)"),
+        ] {
+            let mut state = sample_state();
+            state.staged_update_version = Some(raw.to_string());
+            let layout = FlyoutLayout::compute(
+                dc,
+                &fonts,
+                &LayoutInput {
+                    width: 468,
+                    height: 600,
+                    scale: 1.0,
+                    state: &state,
+                    active_tab: DeviceFlow::Output,
+                    search_query: "",
+                    listen_search_query: "",
+                    active_overlay: &ActiveOverlay::Config,
+                    saving_profile: false,
+                    confirm_quit: false,
+                    device_scroll: 0,
+                    config_scroll: 0,
+                    profile_scroll: 0,
+                    listen_scroll: 0,
+                },
+            );
+            let OverlayLayout::Config(cfg) = &layout.overlay else {
+                panic!("expected config overlay layout");
+            };
+            let label = cfg.rows.iter().find_map(|row| match &row.kind {
+                ConfigRowKind::ActionButton {
+                    action: HitAction::ConfigApplyStagedUpdate,
+                    label,
+                    ..
+                } => Some(label.as_str()),
+                _ => None,
+            });
+            assert_eq!(label, Some(expected));
+        }
 
         unsafe {
             let _ = DeleteDC(dc);

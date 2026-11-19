@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use audio_lock_core::ipc::{AppAction, IpcRequest, IpcResponse, PIPE_NAME, QUIT_EVENT_NAME};
 use audio_lock_core::model::AppState;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+    GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -19,8 +19,7 @@ use windows::Win32::Security::{
     TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FlushFileBuffers, PIPE_ACCESS_DUPLEX,
-    ReadFile, WriteFile,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -40,6 +39,7 @@ use crate::win32::{
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const IO_TIMEOUT_MS: u32 = 2_000;
+const CLIENT_DRAIN_TIMEOUT_MS: u32 = 250;
 
 pub struct IpcContext {
     pub state: Arc<Mutex<AppState>>,
@@ -101,6 +101,12 @@ pub fn spawn_quit_event_listener(quit_pending: Arc<AtomicBool>, wake: WakeHandle
             else {
                 return;
             };
+
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                unsafe {
+                    let _ = ResetEvent(handle);
+                }
+            }
 
             let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
             if wait_result == WAIT_OBJECT_0 {
@@ -170,6 +176,64 @@ fn build_pipe_security_descriptor() -> Option<OwnedSecurityDescriptor> {
     Some(OwnedSecurityDescriptor { sd })
 }
 
+fn create_pipe_instance(
+    pipe_name: &[u16],
+    pipe_sd: Option<&OwnedSecurityDescriptor>,
+) -> Option<OwnedHandle> {
+    let security_attrs = pipe_sd.map(|owned| SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: owned.sd.0,
+        ..Default::default()
+    });
+    let sa_ptr = security_attrs.as_ref().map(std::ptr::from_ref);
+
+    let pipe = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(pipe_name.as_ptr()),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            PIPE_BUFFER_SIZE,
+            PIPE_BUFFER_SIZE,
+            0,
+            sa_ptr,
+        )
+    };
+
+    if pipe.is_invalid() || pipe == INVALID_HANDLE_VALUE {
+        None
+    } else {
+        Some(OwnedHandle(pipe))
+    }
+}
+
+fn dispatch_action(action: IpcAction, ctx: &IpcContext) {
+    match action {
+        IpcAction::None => {}
+        IpcAction::OpenFlyout => {
+            ctx.open_flyout_pending.store(true, Ordering::Release);
+            ctx.wake.post(WM_APP_OPEN_FLYOUT);
+        }
+        IpcAction::Quit => {
+            ctx.quit_pending.store(true, Ordering::Release);
+            ctx.wake.post(WM_APP_QUIT);
+        }
+        IpcAction::CheckUpdates => {
+            ctx.check_updates_pending.store(true, Ordering::Release);
+            ctx.wake.post(WM_APP_CHECK_UPDATES);
+        }
+        IpcAction::ApplyUpdate => {
+            ctx.apply_update_pending.store(true, Ordering::Release);
+            ctx.wake.post(WM_APP_APPLY_UPDATE);
+        }
+    }
+}
+
+fn wait_for_client_eof(pipe: HANDLE, event: HANDLE, timeout_ms: u32) {
+    let mut byte = [0u8; 1];
+    let _ = read_overlapped(pipe, event, &mut byte, timeout_ms);
+}
+
 fn run_server(ctx: IpcContext) {
     let pipe_name = win32::to_wide(PIPE_NAME);
     let pipe_sd = build_pipe_security_descriptor();
@@ -177,64 +241,37 @@ fn run_server(ctx: IpcContext) {
         return;
     };
     let io_event = OwnedHandle(raw_event);
+    let mut pipe: Option<OwnedHandle> = None;
 
     loop {
-        let security_attrs = pipe_sd.as_ref().map(|owned| SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: owned.sd.0,
-            ..Default::default()
-        });
-        let sa_ptr = security_attrs.as_ref().map(std::ptr::from_ref);
-
-        let pipe = unsafe {
-            CreateNamedPipeW(
-                PCWSTR(pipe_name.as_ptr()),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1,
-                PIPE_BUFFER_SIZE,
-                PIPE_BUFFER_SIZE,
-                0,
-                sa_ptr,
-            )
+        let pipe_handle = match pipe.as_ref() {
+            Some(handle) => handle.0,
+            None => {
+                let Some(created) = create_pipe_instance(&pipe_name, pipe_sd.as_ref()) else {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                let raw = created.0;
+                pipe = Some(created);
+                raw
+            }
         };
 
-        if pipe.is_invalid() || pipe == INVALID_HANDLE_VALUE {
-            thread::sleep(Duration::from_millis(100));
+        if !connect_overlapped(pipe_handle, io_event.0) {
+            pipe = None;
+            thread::sleep(Duration::from_millis(50));
             continue;
         }
 
-        if connect_overlapped(pipe, io_event.0) {
-            let (action, wrote_ok) = handle_client(pipe, io_event.0, &ctx);
-            unsafe {
-                if wrote_ok {
-                    let _ = FlushFileBuffers(pipe);
-                }
-                let _ = DisconnectNamedPipe(pipe);
-            }
-            match action {
-                IpcAction::None => {}
-                IpcAction::OpenFlyout => {
-                    ctx.open_flyout_pending.store(true, Ordering::Release);
-                    ctx.wake.post(WM_APP_OPEN_FLYOUT);
-                }
-                IpcAction::Quit => {
-                    ctx.quit_pending.store(true, Ordering::Release);
-                    ctx.wake.post(WM_APP_QUIT);
-                }
-                IpcAction::CheckUpdates => {
-                    ctx.check_updates_pending.store(true, Ordering::Release);
-                    ctx.wake.post(WM_APP_CHECK_UPDATES);
-                }
-                IpcAction::ApplyUpdate => {
-                    ctx.apply_update_pending.store(true, Ordering::Release);
-                    ctx.wake.post(WM_APP_APPLY_UPDATE);
-                }
-            }
+        let (action, wrote_ok) = handle_client(pipe_handle, io_event.0, &ctx);
+        dispatch_action(action, &ctx);
+
+        if wrote_ok {
+            wait_for_client_eof(pipe_handle, io_event.0, CLIENT_DRAIN_TIMEOUT_MS);
         }
 
-        unsafe {
-            let _ = CloseHandle(pipe);
+        if unsafe { DisconnectNamedPipe(pipe_handle) }.is_err() {
+            pipe = None;
         }
     }
 }

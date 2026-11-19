@@ -4,10 +4,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, HWND, LPARAM, LRESULT,
-    POINT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FreeLibrary, GetLastError, HANDLE, HMODULE,
+    HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{SETPROCESSWORKINGSETSIZEEX_FLAGS, SetProcessWorkingSetSizeEx};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::SystemInformation::GetTickCount;
@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SetTimer, WM_SETTINGCHANGE, WM_USER, WNDCLASSW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, s, w};
 
 pub const WM_APP_REFRESH_TRAY: u32 = WM_USER + 1;
 pub const WM_APP_TRAY_EVENT: u32 = WM_USER + 2;
@@ -143,7 +143,110 @@ pub fn idle_duration_ms() -> u32 {
 pub fn is_fullscreen_or_busy() -> bool {
     match unsafe { SHQueryUserNotificationState() } {
         Ok(state) => state != QUNS_ACCEPTS_NOTIFICATIONS && state != QUNS_NOT_PRESENT,
-        Err(_) => false,
+        Err(_) => true,
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct XInputState {
+    dw_packet_number: u32,
+    _gamepad: [u8; 12],
+}
+
+type XInputGetStateFn = unsafe extern "system" fn(u32, *mut XInputState) -> u32;
+
+pub struct ControllerIdleTracker {
+    loaded: bool,
+    module: Option<HMODULE>,
+    get_state: Option<XInputGetStateFn>,
+    prev_packets: [Option<u32>; 4],
+    last_controller_activity: Option<Instant>,
+}
+
+impl Default for ControllerIdleTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControllerIdleTracker {
+    pub fn new() -> Self {
+        Self {
+            loaded: false,
+            module: None,
+            get_state: None,
+            prev_packets: [None; 4],
+            last_controller_activity: None,
+        }
+    }
+
+    pub fn sample_and_idle_ms(&mut self) -> u32 {
+        let kb_mouse_ms = idle_duration_ms();
+        self.ensure_loaded();
+
+        if let Some(get_state) = self.get_state {
+            let now = Instant::now();
+            for (slot, prev_packet) in self.prev_packets.iter_mut().enumerate() {
+                let mut state = XInputState::default();
+                let rc = unsafe { get_state(slot as u32, &mut state) };
+                if rc == ERROR_SUCCESS.0 {
+                    if *prev_packet != Some(state.dw_packet_number) {
+                        *prev_packet = Some(state.dw_packet_number);
+                        self.last_controller_activity = Some(now);
+                    }
+                } else {
+                    *prev_packet = None;
+                }
+            }
+        }
+
+        let ctrl_idle_ms = self.last_controller_activity.map_or(u32::MAX, |at| {
+            at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+        });
+        kb_mouse_ms.min(ctrl_idle_ms)
+    }
+
+    pub fn reset(&mut self) {
+        self.prev_packets = [None; 4];
+        self.last_controller_activity = None;
+    }
+
+    fn ensure_loaded(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+
+        for dll in [w!("xinput1_4.dll"), w!("xinput9_1_0.dll")] {
+            let Ok(module) = (unsafe { LoadLibraryW(dll) }) else {
+                continue;
+            };
+            let proc = unsafe { GetProcAddress(module, s!("XInputGetState")) };
+            if let Some(func) = proc {
+                let get_state = unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, XInputGetStateFn>(
+                        func,
+                    )
+                };
+                self.module = Some(module);
+                self.get_state = Some(get_state);
+                return;
+            }
+            unsafe {
+                let _ = FreeLibrary(module);
+            }
+        }
+    }
+}
+
+impl Drop for ControllerIdleTracker {
+    fn drop(&mut self) {
+        if let Some(module) = self.module.take() {
+            unsafe {
+                let _ = FreeLibrary(module);
+            }
+        }
     }
 }
 

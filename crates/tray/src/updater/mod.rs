@@ -3,7 +3,7 @@ pub mod http;
 pub mod verify;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -167,17 +167,26 @@ impl Updater {
                         current = self.apply_failures.load(Ordering::Acquire);
                     }
                 }
-                if !apply::has_staged_binaries(&staged.dir) {
-                    *self.staged.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.staged_update_version.is_some() {
-                        guard.staged_update_version = None;
-                        let _ = store::save_state(&guard);
-                    }
+                if apply::verify_staged_binary(&staged.dir).is_err() {
+                    clear_corrupted_staged(&self.staged, &self.state, &staged.dir);
                 }
                 false
             }
         }
+    }
+}
+
+fn clear_corrupted_staged(
+    staged: &Arc<Mutex<Option<StagedUpdate>>>,
+    state: &Arc<Mutex<AppState>>,
+    dir: &Path,
+) {
+    let _ = fs::remove_dir_all(dir);
+    *staged.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.staged_update_version.is_some() {
+        guard.staged_update_version = None;
+        let _ = store::save_state(&guard);
     }
 }
 
@@ -209,15 +218,16 @@ fn run_check(
         return;
     }
 
-    let already_staged = {
-        let guard = staged.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().is_some_and(|existing| {
-            !is_newer_version(&existing.version, version) && apply::has_staged_binaries(&existing.dir)
-        })
-    };
-    if already_staged {
+    let existing = staged.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(existing) = existing
+        && !is_newer_version(&existing.version, version)
+    {
+        if apply::verify_staged_binary(&existing.dir).is_ok() {
+            wake.post(WM_APP_UPDATE_STAGED);
+            return;
+        }
+        clear_corrupted_staged(staged, state, &existing.dir);
         wake.post(WM_APP_UPDATE_STAGED);
-        return;
     }
 
     let zip_path = staging_root_dir().join(format!("download-{version}.zip.tmp"));
