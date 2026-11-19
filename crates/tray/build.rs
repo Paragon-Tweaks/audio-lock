@@ -6,6 +6,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/app.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-env-changed=AUDIO_LOCK_REQUIRE_AUTHENTICODE");
+    println!("cargo:rerun-if-env-changed=AUDIO_LOCK_EXPECTED_PUBLISHER");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

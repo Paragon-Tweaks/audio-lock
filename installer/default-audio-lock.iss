@@ -1,16 +1,28 @@
-#ifndef AppVersion
-  #define AppVersion "0.1.0"
+#ifndef MyAppVersion
+  #ifdef AppVersion
+    #define MyAppVersion AppVersion
+  #else
+    #define MyAppVersion "0.1.0"
+  #endif
 #endif
 
-#ifndef SourceDir
-  #define SourceDir "..\target\release"
+#ifndef MyAppExeName
+  #define MyAppExeName "default-audio-lock.exe"
+#endif
+
+#ifndef AppExePath
+  #ifdef SourceDir
+    #define AppExePath AddBackslash(SourceDir) + MyAppExeName
+  #else
+    #define AppExePath "..\target\release\default-audio-lock.exe"
+  #endif
 #endif
 
 [Setup]
 AppId={{8E9A7B2C-4D5E-4F1A-9B3C-2D1E0F4A5B6C}
 AppName=Audio Lock
-AppVersion={#AppVersion}
-AppVerName=Audio Lock {#AppVersion}
+AppVersion={#MyAppVersion}
+AppVerName=Audio Lock {#MyAppVersion}
 AppPublisher=Paragon Tweaks
 AppPublisherURL=https://paragontweaks.net
 AppSupportURL=https://github.com/Paragon-Tweaks/audio-lock/issues
@@ -27,7 +39,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=DefaultAudioLock-Setup-{#AppVersion}
+OutputBaseFilename=DefaultAudioLock-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -45,7 +57,7 @@ Name: "autostart"; Description: "Start Audio Lock when Windows starts"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
-Source: "{#SourceDir}\default-audio-lock.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#AppExePath}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Audio Lock"; Filename: "{app}\default-audio-lock.exe"

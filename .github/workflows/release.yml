@@ -1,23 +1,59 @@
-name: Release
+name: CI & Manual Unsigned Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
         description: "Release version (e.g. 0.2.0). Defaults to Cargo.toml version if omitted."
         required: false
         type: string
+      publish_draft:
+        description: "Also upload unsigned assets to a draft GitHub Release (never overwrites signed releases)."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build & Publish Windows Release
+  check:
+    name: Clippy & Tests
     runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+  # Signed production releases are built, Authenticode-signed with the hardware token,
+  # and published locally via scripts/build-release.ps1.
+  # Pushing a v* tag intentionally does NOT trigger this job so CI can never race
+  # or overwrite locally signed release assets with unsigned binaries.
+  manual-unsigned-release:
+    name: Manual Unsigned Release Packaging
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: check
+    runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -33,13 +69,9 @@ jobs:
         id: version
         shell: pwsh
         env:
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if ($env:REF_TYPE -eq "tag") {
-            $ver = $env:REF_NAME -replace '^[vV]', ''
-          } elseif (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
             $ver = $env:INPUT_VERSION.Trim() -replace '^[vV]', ''
           } else {
             $cargo = Get-Content -Path "Cargo.toml" -Raw
@@ -52,106 +84,47 @@ jobs:
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Verify release version matches Cargo.toml
-        shell: pwsh
-        env:
-          TAG_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          $tagVersion = $env:TAG_VERSION.Trim()
-          $semverRegex = '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$'
-          if ($tagVersion -notmatch $semverRegex) {
-            throw "Release version '$tagVersion' does not match strict semver pattern '$semverRegex'."
-          }
-
-          $cargo = Get-Content -Path "Cargo.toml" -Raw
-          if ($cargo -match '(?ms)^\[workspace\.package\]\s*\r?\n(.*?)(?=^\[|\z)' -and $Matches[1] -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
-            $cargoVersion = $Matches[1].Trim()
-          } else {
-            throw "Could not parse [workspace.package].version from Cargo.toml."
-          }
-
-          if ($cargoVersion -notmatch $semverRegex) {
-            throw "Cargo.toml [workspace.package].version '$cargoVersion' does not match strict semver pattern '$semverRegex'."
-          }
-
-          if ($tagVersion -ne $cargoVersion) {
-            throw "Release version '$tagVersion' does not match Cargo.toml [workspace.package].version '$cargoVersion'."
-          }
-
-          Write-Host "Verified release version $tagVersion matches Cargo.toml."
-
-      - name: Run workspace clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run workspace tests
-        run: cargo test --workspace
-
-      - name: Build release binary
-        env:
-          AUDIO_LOCK_GITHUB_REPO: ${{ github.repository }}
-        run: cargo build --release --workspace
-
-      # Optional Authenticode signing for the application binary before zipping & installer packaging.
-      # Set repository variable ENABLE_CODE_SIGNING=true and configure certificate secrets (or Azure Trusted Signing).
-      - name: Sign application binary (optional)
-        if: ${{ vars.ENABLE_CODE_SIGNING == 'true' }}
-        shell: pwsh
-        run: |
-          # Example using signtool.exe with an imported PFX certificate:
-          # signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
-          #   target\release\default-audio-lock.exe
-          # Or use azure/trusted-signing-action@v0 against target\release\default-audio-lock.exe
-          Write-Host "Code signing step enabled; plug in signtool or Azure Trusted Signing here."
-
-      - name: Package update zip, installer, and manifest
+      - name: Build & package unsigned release assets
         shell: pwsh
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           GITHUB_REPO: ${{ github.repository }}
         run: |
-          $version = $env:RELEASE_VERSION
-          New-Item -ItemType Directory -Path "dist" -Force | Out-Null
+          .\scripts\build-release.ps1 `
+            -Version $env:RELEASE_VERSION `
+            -GithubRepo $env:GITHUB_REPO `
+            -Unsigned `
+            -NoPublish `
+            -SkipTests
 
-          $trayExe = "target\release\default-audio-lock.exe"
-          $updateZip = "dist\default-audio-lock-win64-update.zip"
-          Compress-Archive -Path $trayExe -DestinationPath $updateZip -Force
-
-          $isccCmd = Get-Command "iscc.exe" -ErrorAction SilentlyContinue
-          $iscc = if ($isccCmd) { $isccCmd.Source } else { "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          if (-not (Test-Path -LiteralPath $iscc)) {
-            throw "Inno Setup 6 (iscc.exe) not found."
+          $expected = @(
+            "dist\DefaultAudioLock-Setup-$($env:RELEASE_VERSION).exe",
+            "dist\default-audio-lock-win64-update.zip",
+            "dist\manifest.json"
+          )
+          foreach ($file in $expected) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Expected unsigned release artifact was not produced: $file"
+            }
           }
-          & $iscc "/DAppVersion=$version" "installer\default-audio-lock.iss"
-          if ($LASTEXITCODE -ne 0) {
-            throw "iscc failed with exit code $LASTEXITCODE"
-          }
 
-          $sha256 = (Get-FileHash -Path $updateZip -Algorithm SHA256).Hash.ToLowerInvariant()
-          $publishedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          $assetUrl = "https://github.com/$($env:GITHUB_REPO)/releases/download/v$version/default-audio-lock-win64-update.zip"
+      - name: Upload unsigned workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-lock-unsigned-v${{ steps.version.outputs.version }}
+          path: |
+            dist/DefaultAudioLock-Setup-*.exe
+            dist/default-audio-lock-win64-update.zip
+            dist/manifest.json
+          if-no-files-found: error
 
-          $manifest = [ordered]@{
-            version      = $version
-            published_at = $publishedAt
-            sha256       = $sha256
-            asset_url    = $assetUrl
-          } | ConvertTo-Json -Depth 2
-          [System.IO.File]::WriteAllText((Join-Path (Get-Location) "dist\manifest.json"), $manifest + "`n", [System.Text.UTF8Encoding]::new($false))
-
-      # Optional Authenticode signing for the generated setup executable.
-      - name: Sign setup installer (optional)
-        if: ${{ vars.ENABLE_CODE_SIGNING == 'true' }}
-        shell: pwsh
-        run: |
-          # Example using signtool.exe:
-          # signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 `
-          #   "dist\DefaultAudioLock-Setup-${{ steps.version.outputs.version }}.exe"
-          Write-Host "Installer code signing step enabled; plug in signtool or Azure Trusted Signing here."
-
-      - name: Publish GitHub Release
+      - name: Publish unsigned draft GitHub Release (optional)
+        if: ${{ inputs.publish_draft == true }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          name: Audio Lock ${{ steps.version.outputs.tag }} (Unsigned Draft)
+          draft: true
           generate_release_notes: true
           files: |
             dist/DefaultAudioLock-Setup-*.exe

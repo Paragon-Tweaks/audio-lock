@@ -86,31 +86,41 @@ Per-user installer (`%LOCALAPPDATA%\Programs\DefaultAudioLock`). No Admin rights
 
 Requires Rust 1.85+ (stable toolchain, `x86_64-pc-windows-msvc`).
 
-```powershell
-# Build release binary (target\release\default-audio-lock.exe)
-cargo build --release --workspace
+### Unsigned Local Test Build
 
-# Run tests and lints
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-### Local Release Packaging
-
-Packages `dist\default-audio-lock-win64-update.zip`, `dist\manifest.json` (with SHA-256 hash), and `dist\DefaultAudioLock-Setup-<version>.exe` (when Inno Setup 6 is installed):
+Use `scripts\build-unsigned.ps1` for fast local iteration without a code-signing token. It runs `clippy` and unit tests (skip with `-SkipChecks`), clears Authenticode signature requirements for test builds, and builds `target\release\default-audio-lock.exe`:
 
 ```powershell
-.\scripts\build-release.ps1 -GithubRepo Paragon-Tweaks/audio-lock
+# Run checks and build unsigned release binary
+.\scripts\build-unsigned.ps1
+
+# Fast iteration (skip clippy/tests)
+.\scripts\build-unsigned.ps1 -SkipChecks
+
+# Also package unsigned zip, manifest.json, and installer into dist\unsigned\
+.\scripts\build-unsigned.ps1 -Package
 ```
 
-### Automated GitHub Releases
+### Signed Release & Publish
 
-Pushing a version tag (`v*`) runs [`.github/workflows/release.yml`](.github/workflows/release.yml) to test the workspace, compile with `AUDIO_LOCK_GITHUB_REPO` set for auto-updates, build the Inno Setup installer, and publish the release assets:
+Official releases are Authenticode-signed locally using a Sectigo hardware code-signing token (`signtool.exe` from the Windows 10/11 SDK), Inno Setup 6 (`winget install JRSoftware.InnoSetup`), and GitHub CLI (`gh`).
+
+`scripts\build-release.ps1` validates the version against `Cargo.toml`, runs `clippy` and unit tests, compiles with strict Authenticode updater verification enabled, signs and verifies both `default-audio-lock.exe` and `DefaultAudioLock-Setup-<version>.exe`, generates `dist\default-audio-lock-win64-update.zip` and `dist\manifest.json`, pushes the `v<version>` tag, and creates the GitHub Release:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+# Build, sign, package, and verify locally in dist\ without tagging or publishing
+.\scripts\build-release.ps1 -NoPublish
+
+# Publish as a draft GitHub Release
+.\scripts\build-release.ps1 -Draft
+
+# Full signed release & publish (optional: pass -CertSubject "Tulantro LLC" or -CertSha1 <thumbprint>)
+.\scripts\build-release.ps1
 ```
+
+### Continuous Integration
+
+GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) automatically runs `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on every push to `main` and pull request. Tag pushes (`v*`) do not trigger unsigned CI releases, keeping signed releases owned cleanly by `scripts\build-release.ps1`. A manual `workflow_dispatch` option is also available for unsigned CI packaging.
 
 ## License
 
